@@ -1,0 +1,533 @@
+---
+title: "Deconvolution Diagnostics & Signature Matrix Validation"
+subtitle: "Pipeline step 4 of 4 -- run after 1_TG_sc_reprocessing.qmd and 3_TG_incoming_sample_QC_maturation.qmd; interrogates why NNLS collapses to ~2 identities"
+author: "Austin Hovland"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+editor: visual
+execute:
+  echo: true
+  warning: false
+  message: false
+  cache: true
+---
+
+## Purpose
+
+The weekly maturation notebook (`3_TG_incoming_sample_QC_maturation.qmd`) flags that its NNLS deconvolution output is suspicious: nearly all TG-bulk specimen-weeks collapse onto essentially **two** reference identities (a dominant NF2 fraction plus one non-neuronal identity), with every other column in the 11-identity signature matrix reading exactly 0.0. That is either (a) a genuine and striking biological result, or (b) a signature matrix that is not mathematically identifiable at the resolution the plots imply. This notebook does not re-run the weekly QC; it exists purely to adjudicate that question with four diagnostics run in order:
+
+1.  **Signature matrix collinearity audit** -- pairwise correlation and variance-inflation-factor (VIF) analysis of the 11 reference identity columns, restricted to the exact marker genes used by NNLS.
+2.  **Synthetic mixture recovery test** -- known synthetic mixtures built from the reference profiles themselves are passed back through the identical NNLS pipeline; failure to recover ground truth here proves an identifiability problem independent of any biology in the real samples.
+3.  **Alternative deconvolution cross-validation** -- the same incoming samples are deconvolved with a second, differently-regularized method (ridge-dampened least squares) and compared against the NNLS fractions.
+4.  **Marker-gene specificity re-screen** -- every curated marker gene is ranked by fold-change specificity against its next-best-matching identity, surfacing markers that are actually shared across subtypes and therefore contributing to collapse.
+
+This notebook assumes `1_TG_sc_reprocessing.qmd` has been run (so `results/pseudobulk/` is populated) and that `3_TG_incoming_sample_QC_maturation.qmd` has been run at least once (so `results/incoming_qc/` contains the current incoming-sample joint-normalized data and NNLS output referenced below).
+
+## Setup
+
+```{r}
+#| label: setup
+
+library(dplyr)
+library(tidyr)
+library(readr)
+library(tibble)
+library(purrr)
+library(stringr)
+library(ggplot2)
+library(ggrepel)
+library(pheatmap)
+library(edgeR)
+
+if (!requireNamespace("nnls", quietly = TRUE)) {
+  install.packages("nnls", repos = "https://cloud.r-project.org")
+}
+library(nnls)
+
+dir.create("results/deconvolution_diagnostics", recursive = TRUE, showWarnings = FALSE)
+
+combined_dge <- readRDS(
+  "results/pseudobulk/GSE197289_TG_combined_reference_edgeR_dge.rds"
+)
+
+combined_logcpm <- as.matrix(
+  read.csv(
+    "results/pseudobulk/GSE197289_TG_combined_reference_logCPM.csv",
+    row.names = 1,
+    check.names = FALSE
+  )
+)
+
+combined_metadata <- read_csv(
+  "results/pseudobulk/GSE197289_TG_combined_reference_metadata.csv",
+  show_col_types = FALSE
+)
+
+combined_marker_manifest <- read_csv(
+  "results/pseudobulk/GSE197289_TG_combined_marker_manifest.csv",
+  show_col_types = FALSE
+)
+
+incoming_sample_metadata <- read_csv(
+  "results/incoming_qc/incoming_sample_metadata.csv",
+  show_col_types = FALSE
+)
+
+stopifnot(identical(colnames(combined_logcpm), combined_metadata$pseudobulk_id))
+
+neuronal_identity_labels <- combined_metadata |>
+  filter(reference_level == "Neuronal subtype") |>
+  pull(reference_label) |>
+  as.character() |>
+  unique()
+```
+
+## Rebuild the exact signature matrix used by NNLS
+
+To diagnose the deconvolution honestly, this section reconstructs the identical identity-averaged signature matrix that `3_TG_incoming_sample_QC_maturation.qmd` passes into `nnls::nnls()` -- same marker genes, same per-identity averaging -- rather than a fresh approximation, so every downstream diagnostic is evaluating the actual object responsible for the striking result.
+
+```{r}
+#| label: rebuild-signature-matrix
+
+deconv_signature_genes <- combined_marker_manifest |>
+  filter(gene %in% rownames(combined_logcpm)) |>
+  pull(gene) |>
+  unique()
+
+signature_matrix_linear <- 2^combined_logcpm[deconv_signature_genes, , drop = FALSE]
+
+signature_identity_map <- combined_metadata |>
+  transmute(pseudobulk_id, reference_label = as.character(reference_label)) |>
+  filter(pseudobulk_id %in% colnames(signature_matrix_linear))
+
+identity_levels <- unique(signature_identity_map$reference_label)
+
+signature_matrix_by_identity <- sapply(identity_levels, function(id_lab) {
+  cols <- signature_identity_map$pseudobulk_id[signature_identity_map$reference_label == id_lab]
+  if (length(cols) == 1) return(signature_matrix_linear[, cols])
+  rowMeans(signature_matrix_linear[, cols, drop = FALSE])
+})
+colnames(signature_matrix_by_identity) <- identity_levels
+
+signature_summary <- tibble(
+  metric = c(
+    "Marker genes in signature matrix",
+    "Reference identities (columns)",
+    "Neuronal-subtype identities",
+    "Broad non-neuronal identities"
+  ),
+  value = c(
+    nrow(signature_matrix_by_identity),
+    ncol(signature_matrix_by_identity),
+    sum(identity_levels %in% neuronal_identity_labels),
+    sum(!identity_levels %in% neuronal_identity_labels)
+  )
+)
+
+knitr::kable(signature_summary)
+```
+
+## Diagnostic 1 -- signature matrix collinearity audit
+
+If NF1, NF2, NF3, PEP, and NP are highly correlated with each other across the curated marker genes, NNLS has no mathematical way to assign expression uniquely to one of them -- it will arbitrarily favor whichever column best explains the residual, typically the one with marginally higher marker expression on average. The condition number and per-identity VIF quantify exactly how ill-posed this system is, independent of any real sample.
+
+```{r}
+#| label: fig-signature-collinearity
+#| fig-width: 10
+#| fig-height: 9
+
+log_signature_matrix <- log2(signature_matrix_by_identity + 1)
+
+identity_cor <- cor(log_signature_matrix, method = "pearson")
+
+pheatmap(
+  identity_cor,
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  display_numbers = TRUE,
+  number_format = "%.2f",
+  main = "Pairwise correlation between reference identity signature columns\n(log2 marker-gene expression, the exact NNLS signature matrix)"
+)
+
+compute_vif <- function(x) {
+  vif_out <- map_dbl(seq_len(ncol(x)), function(i) {
+    y <- x[, i]
+    preds <- x[, -i, drop = FALSE]
+    fit <- lm(y ~ preds)
+    r2 <- summary(fit)$r.squared
+    if (r2 >= 0.999999) return(Inf)
+    1 / (1 - r2)
+  })
+  names(vif_out) <- colnames(x)
+  vif_out
+}
+
+identity_vif <- compute_vif(log_signature_matrix)
+
+vif_table <- tibble(
+  reference_identity = names(identity_vif),
+  vif = identity_vif
+) |>
+  mutate(
+    collinearity_flag = case_when(
+      vif >= 10 ~ "severe (VIF >= 10)",
+      vif >= 5 ~ "moderate (VIF 5-10)",
+      TRUE ~ "acceptable (VIF < 5)"
+    )
+  ) |>
+  arrange(desc(vif))
+
+knitr::kable(vif_table, digits = 2)
+
+signature_matrix_condition_number <- kappa(log_signature_matrix, exact = TRUE)
+
+message(
+  "Signature matrix condition number: ", round(signature_matrix_condition_number, 1),
+  " (values above ~30 are generally considered ill-conditioned for regression)"
+)
+
+write.csv(
+  vif_table,
+  "results/deconvolution_diagnostics/signature_matrix_vif.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  as.data.frame(identity_cor),
+  "results/deconvolution_diagnostics/signature_matrix_identity_correlation.csv"
+)
+```
+
+A VIF above 10 (or a very high condition number) for NF1/NF2/NF3/PEP/NP would directly explain why the solver collapses to one dominant neuronal column regardless of the true underlying mixture -- the columns are not statistically distinguishable given this marker gene set.
+
+## Diagnostic 2 -- synthetic mixture recovery test
+
+This is the most direct test available: build known mixtures **from the reference pseudobulk profiles themselves**, run them through the identical NNLS call used on real incoming samples, and check whether the true mixing proportions come back out. If a 100% single-identity spike-in already fails to recover cleanly, or a multi-identity mixture collapses to fewer identities than were mixed in, the problem is the signature matrix itself, not the biology of any real sample.
+
+```{r}
+#| label: synthetic-recovery-test
+
+run_nnls_fraction <- function(sample_expr, sig_matrix) {
+  fit <- nnls::nnls(as.matrix(sig_matrix), as.numeric(sample_expr))
+  coefs <- pmax(fit$x, 0)
+  if (sum(coefs) == 0) coefs <- rep(0, length(coefs))
+  else coefs <- coefs / sum(coefs)
+  names(coefs) <- colnames(sig_matrix)
+  coefs
+}
+
+set.seed(197289)
+
+build_synthetic_mixture <- function(true_props, sig_matrix) {
+  stopifnot(all(names(true_props) %in% colnames(sig_matrix)))
+  full_props <- setNames(rep(0, ncol(sig_matrix)), colnames(sig_matrix))
+  full_props[names(true_props)] <- true_props
+  as.numeric(sig_matrix %*% full_props)
+}
+
+synthetic_scenarios <- list(
+  pure_NF2 = c(NF2 = 1),
+  pure_NF1 = c(NF1 = 1),
+  pure_PEP = c(PEP = 1),
+  two_way_NF2_glia = c(NF2 = 0.6, `Satellite glia` = 0.4),
+  three_way_realistic = c(NF2 = 0.5, NF3 = 0.2, `Satellite glia` = 0.3),
+  five_neuronal_even = c(NF1 = 0.2, NF2 = 0.2, NF3 = 0.2, PEP = 0.2, NP = 0.2),
+  neuronal_glia_immune = c(NF2 = 0.5, `Satellite glia` = 0.3, Immune = 0.2)
+)
+
+synthetic_scenarios <- synthetic_scenarios[
+  map_lgl(synthetic_scenarios, function(p) all(names(p) %in% colnames(signature_matrix_by_identity)))
+]
+
+synthetic_results <- imap_dfr(synthetic_scenarios, function(true_props, scenario_name) {
+  synthetic_expr <- build_synthetic_mixture(true_props, signature_matrix_by_identity)
+  recovered <- run_nnls_fraction(synthetic_expr, signature_matrix_by_identity)
+
+  true_full <- setNames(rep(0, length(recovered)), names(recovered))
+  true_full[names(true_props)] <- true_props
+
+  tibble(
+    scenario = scenario_name,
+    reference_identity = names(recovered),
+    true_fraction = true_full[names(recovered)],
+    recovered_fraction = recovered
+  )
+})
+
+synthetic_summary <- synthetic_results |>
+  group_by(scenario) |>
+  summarise(
+    n_true_identities = sum(true_fraction > 0),
+    n_recovered_identities = sum(recovered_fraction > 0.01),
+    max_abs_error = max(abs(true_fraction - recovered_fraction)),
+    correctly_dominant = names(which.max(setNames(recovered_fraction, reference_identity)))[1],
+    .groups = "drop"
+  )
+
+knitr::kable(synthetic_summary, digits = 3)
+
+ggplot(
+  synthetic_results |> filter(true_fraction > 0 | recovered_fraction > 0.01),
+  aes(x = reference_identity, y = recovered_fraction, fill = reference_identity)
+) +
+  geom_col() +
+  geom_point(aes(y = true_fraction), shape = 4, size = 3, stroke = 1.4, color = "black") +
+  facet_wrap(~ scenario, scales = "free_x", ncol = 3) +
+  labs(
+    title = "Synthetic mixture recovery: bars = NNLS-recovered fraction, X = ground truth",
+    subtitle = "Mixtures built directly from reference pseudobulk profiles and passed through the identical NNLS call",
+    x = "Reference identity",
+    y = "Fraction"
+  ) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none")
+
+write.csv(
+  synthetic_results,
+  "results/deconvolution_diagnostics/synthetic_mixture_recovery.csv",
+  row.names = FALSE
+)
+```
+
+If `n_recovered_identities` is consistently lower than `n_true_identities` across scenarios -- especially for `five_neuronal_even`, which mixes five neuronal subtypes in genuinely equal proportion -- that is direct proof the signature matrix cannot resolve those identities, independent of anything biological about TGN1003A, TGN1028B, TGN1215AvX, or TGN251028B.
+
+## Diagnostic 3 -- alternative deconvolution cross-validation
+
+NNLS has no regularization and will happily drive collinear coefficients to exactly zero rather than splitting credit between them, which can visually exaggerate a "two-identity" result. A ridge-dampened (L2-penalized) least-squares solve, re-normalized to sum to 1, handles collinearity differently -- comparing the two methods on the same real incoming samples shows whether the NF2-dominant pattern is a property of the biology or an artifact of the specific solver's handling of collinear columns.
+
+```{r}
+#| label: ridge-deconvolution-comparison
+#| fig-width: 11
+#| fig-height: 6
+
+incoming_qc_flags <- read_csv(
+  "results/incoming_qc/incoming_sample_qc_flags.csv",
+  show_col_types = FALSE
+)
+
+incoming_deconv_existing <- read_csv(
+  "results/incoming_qc/weekly_nnls_deconvolution_fractions.csv",
+  show_col_types = FALSE
+)
+
+incoming_counts_path <- "RealTGN.salmon.merged.gene_counts.tsv"
+
+incoming_quant <- read_tsv(incoming_counts_path, show_col_types = FALSE)
+incoming_sample_ids_raw <- setdiff(colnames(incoming_quant), c("gene_id", "gene_name"))
+
+incoming_counts_tbl <- incoming_quant |>
+  transmute(
+    gene_name = toupper(trimws(gene_name)),
+    across(all_of(incoming_sample_ids_raw), as.numeric)
+  ) |>
+  filter(!is.na(gene_name), gene_name != "") |>
+  group_by(gene_name) |>
+  summarise(across(all_of(incoming_sample_ids_raw), \(x) sum(x, na.rm = TRUE)), .groups = "drop")
+
+incoming_counts <- incoming_counts_tbl |> as.data.frame()
+rownames(incoming_counts) <- incoming_counts$gene_name
+incoming_counts$gene_name <- NULL
+incoming_counts <- as.matrix(incoming_counts)
+
+reference_gene_key <- toupper(rownames(combined_dge$counts))
+shared_gene_key <- intersect(reference_gene_key, rownames(incoming_counts))
+
+reference_counts_shared <- combined_dge$counts[match(shared_gene_key, reference_gene_key), , drop = FALSE]
+incoming_counts_shared <- incoming_counts[match(shared_gene_key, rownames(incoming_counts)), , drop = FALSE]
+rownames(reference_counts_shared) <- shared_gene_key
+rownames(incoming_counts_shared) <- shared_gene_key
+
+joint_counts <- cbind(reference_counts_shared, incoming_counts_shared)
+joint_dge <- DGEList(counts = joint_counts)
+joint_dge <- calcNormFactors(joint_dge, method = "TMM")
+joint_logcpm <- cpm(joint_dge, log = TRUE, prior.count = 2)
+
+incoming_ids <- incoming_sample_metadata$sample_id
+incoming_linear_expr <- 2^joint_logcpm[deconv_signature_genes, incoming_ids, drop = FALSE]
+
+run_ridge_fraction <- function(sample_expr, sig_matrix, lambda = 1) {
+  A <- as.matrix(sig_matrix)
+  b <- as.numeric(sample_expr)
+  ridge_solution <- solve(t(A) %*% A + lambda * diag(ncol(A)), t(A) %*% b)
+  coefs <- pmax(as.numeric(ridge_solution), 0)
+  if (sum(coefs) == 0) coefs <- rep(0, length(coefs)) else coefs <- coefs / sum(coefs)
+  names(coefs) <- colnames(sig_matrix)
+  coefs
+}
+
+ridge_fractions <- apply(incoming_linear_expr, 2, run_ridge_fraction, sig_matrix = signature_matrix_by_identity, lambda = 1)
+ridge_fractions <- as.data.frame(t(ridge_fractions)) |> rownames_to_column("sample_id")
+
+ridge_long <- ridge_fractions |>
+  pivot_longer(-sample_id, names_to = "reference_identity", values_to = "ridge_fraction") |>
+  left_join(
+    incoming_sample_metadata |> select(sample_id, specimen_id, sample_class, maturation_week),
+    by = "sample_id"
+  ) |>
+  filter(!is.na(maturation_week)) |>
+  group_by(specimen_id, sample_class, maturation_week, reference_identity) |>
+  summarise(ridge_fraction = mean(ridge_fraction, na.rm = TRUE), .groups = "drop")
+
+method_comparison <- incoming_deconv_existing |>
+  rename(nnls_fraction = estimated_fraction) |>
+  full_join(
+    ridge_long,
+    by = c("specimen_id", "sample_class", "maturation_week", "reference_identity")
+  ) |>
+  mutate(
+    nnls_fraction = replace_na(nnls_fraction, 0),
+    ridge_fraction = replace_na(ridge_fraction, 0),
+    abs_disagreement = abs(nnls_fraction - ridge_fraction)
+  )
+
+method_agreement_summary <- method_comparison |>
+  group_by(specimen_id, maturation_week) |>
+  summarise(
+    n_identities_nnls = sum(nnls_fraction > 0.01),
+    n_identities_ridge = sum(ridge_fraction > 0.01),
+    mean_abs_disagreement = mean(abs_disagreement),
+    .groups = "drop"
+  )
+
+knitr::kable(method_agreement_summary, digits = 3)
+
+ggplot(
+  method_comparison |> filter(nnls_fraction > 0.01 | ridge_fraction > 0.01),
+  aes(x = nnls_fraction, y = ridge_fraction, color = reference_identity)
+) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey60") +
+  geom_point(size = 2.6, alpha = 0.85) +
+  labs(
+    title = "NNLS vs. ridge-dampened deconvolution fraction per identity",
+    subtitle = "Points on the dashed line indicate method agreement; systematic deviation flags solver-dependent collapse",
+    x = "NNLS-estimated fraction",
+    y = "Ridge-estimated fraction (lambda = 1)",
+    color = "Reference identity"
+  ) +
+  theme_classic()
+
+write.csv(
+  method_comparison,
+  "results/deconvolution_diagnostics/nnls_vs_ridge_comparison.csv",
+  row.names = FALSE
+)
+```
+
+If the ridge solution consistently spreads mass across NF1/NF2/NF3/PEP/NP where NNLS puts everything on NF2 alone, that is strong evidence the true signal is "broadly neuronal, subtype-ambiguous" rather than "specifically NF2" -- an important distinction for how you describe maturation identity in any downstream report.
+
+## Diagnostic 4 -- marker-gene specificity re-screen
+
+The curated marker manifest was built by domain knowledge, not by re-checking specificity against this exact combined reference. This re-screen ranks every marker gene by how well it distinguishes its assigned identity from the single next-best-matching identity in the reference, surfacing markers that are quietly shared across subtypes and are therefore contributing degenerate columns to the signature matrix above.
+
+```{r}
+#| label: fig-marker-specificity-rescreen
+#| fig-width: 12
+#| fig-height: 8
+
+marker_specificity <- combined_marker_manifest |>
+  filter(gene %in% rownames(combined_logcpm)) |>
+  rowwise() |>
+  mutate(
+    own_identity_expr = {
+      own_cols <- signature_identity_map$pseudobulk_id[signature_identity_map$reference_label == marker_group]
+      if (length(own_cols) == 0) NA_real_ else mean(combined_logcpm[gene, own_cols])
+    }
+  ) |>
+  ungroup()
+
+expr_by_identity_long <- combined_logcpm[unique(marker_specificity$gene), , drop = FALSE] |>
+  as.data.frame() |>
+  rownames_to_column("gene") |>
+  pivot_longer(-gene, names_to = "pseudobulk_id", values_to = "log_cpm") |>
+  left_join(signature_identity_map, by = "pseudobulk_id") |>
+  group_by(gene, reference_label) |>
+  summarise(mean_log_cpm = mean(log_cpm), .groups = "drop")
+
+specificity_scores <- marker_specificity |>
+  select(gene, marker_group) |>
+  distinct() |>
+  left_join(expr_by_identity_long, by = "gene") |>
+  group_by(gene, marker_group) |>
+  summarise(
+    own_expr = mean_log_cpm[reference_label == marker_group][1],
+    next_best_identity = reference_label[reference_label != marker_group][
+      which.max(mean_log_cpm[reference_label != marker_group])
+    ],
+    next_best_expr = max(mean_log_cpm[reference_label != marker_group]),
+    .groups = "drop"
+  ) |>
+  mutate(
+    specificity_log2fc = own_expr - next_best_expr,
+    low_specificity_flag = specificity_log2fc < 1
+  ) |>
+  arrange(specificity_log2fc)
+
+knitr::kable(
+  specificity_scores |> filter(low_specificity_flag) |> arrange(specificity_log2fc),
+  digits = 2,
+  caption = "Curated markers with < 2-fold specificity over their next-best-matching identity"
+)
+
+ggplot(
+  specificity_scores,
+  aes(x = specificity_log2fc, y = reorder(gene, specificity_log2fc), fill = marker_group)
+) +
+  geom_col() +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "grey40") +
+  labs(
+    title = "Marker-gene specificity vs. next-best-matching identity",
+    subtitle = "Dashed line = 2-fold specificity floor; genes left of the line are the likely source of signature-matrix collinearity",
+    x = "log2(own identity expression / next-best identity expression)",
+    y = NULL,
+    fill = "Marker program"
+  ) +
+  theme_classic() +
+  theme(axis.text.y = element_text(size = 7))
+
+write.csv(
+  specificity_scores,
+  "results/deconvolution_diagnostics/marker_specificity_rescreen.csv",
+  row.names = FALSE
+)
+```
+
+Any marker gene flagged here as low-specificity is a direct, actionable target: either drop it from the signature matrix or replace it with a more specific alternative from the single-cell reference, then re-run `3_TG_incoming_sample_QC_maturation.qmd`'s NNLS section to see whether subtype resolution improves.
+
+## Summary and verdict
+
+```{r}
+#| label: diagnostics-summary
+
+diagnostics_summary <- tibble(
+  diagnostic = c(
+    "Max VIF among neuronal-subtype identities",
+    "Signature matrix condition number",
+    "Synthetic scenarios with recovered identity count < true identity count",
+    "Mean |NNLS - ridge| disagreement across specimen-weeks",
+    "Curated markers below 2-fold specificity floor"
+  ),
+  value = c(
+    round(max(vif_table$vif[vif_table$reference_identity %in% neuronal_identity_labels], na.rm = TRUE), 1),
+    round(signature_matrix_condition_number, 1),
+    sum(synthetic_summary$n_recovered_identities < synthetic_summary$n_true_identities),
+    round(mean(method_agreement_summary$mean_abs_disagreement), 3),
+    sum(specificity_scores$low_specificity_flag)
+  )
+)
+
+knitr::kable(diagnostics_summary)
+```
+
+Read this table before trusting any subtype-level NNLS fraction reported in `3_TG_incoming_sample_QC_maturation.qmd`. A high VIF/condition number, failed synthetic recovery, large NNLS-vs-ridge disagreement, and multiple low-specificity markers together would confirm that the "two-identity" result is a signature-matrix identifiability artifact; if instead these diagnostics come back clean, the NF2-dominant pattern deserves to be reported as a genuine biological finding rather than caveated as exploratory.
+
+## Next steps checklist
+
+- If VIF/condition-number flags are severe, collapse the signature matrix to fewer, well-separated super-identities (e.g. merge NF1/NF2/NF3 into one "neurofilament-high" column) before attempting subtype-resolution claims.
+- If synthetic recovery fails even for `five_neuronal_even`, do not report subtype-level composition at all until the marker panel is rebuilt with identity-specific genes surfaced by Diagnostic 4.
+- If NNLS and ridge disagree substantially, prefer the ridge (or another regularized) estimate for any external-facing report, since it degrades more gracefully under collinearity.
+- Any marker gene flagged as low-specificity here should be cross-checked against the original GSE197289 subtype marker literature before removal, in case the shared expression reflects genuine biological overlap rather than a curation error.
+- Re-run this notebook whenever the marker manifest or combined pseudobulk reference is rebuilt in `1_TG_sc_reprocessing.qmd`, since all four diagnostics depend directly on those artifacts.

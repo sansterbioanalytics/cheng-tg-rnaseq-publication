@@ -1,0 +1,2 @@
+# Empty terminal fields in submission TSVs are required by the templates.
+sra_submission/*.tsv whitespace=-blank-at-eol

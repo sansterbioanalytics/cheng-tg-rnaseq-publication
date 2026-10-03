@@ -1,0 +1,1709 @@
+---
+title: "Cheng et al. | TG RNA-seq analysis record"
+subtitle: "Publication code export — Figure 2 and supplementary RNA-seq panels"
+date: 2026-09-27
+format:
+  html:
+    toc: true
+    code-fold: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+This notebook is the source of record for the corrected Figure 2C–F and Supplemental Figure 1A–E RNA-seq panel set. It also exports reference keys. The author confirmed on 2026-09-27 that source ID `TAK2204464A` is **hDRG 2**; source ID `hDRG` is **hDRG 1**. The source identifiers remain unchanged in input and provenance tables, while plots use confirmed biological labels. If this mapping changes, revise it and rerun from the count matrix before using the panels.
+
+The preparation/sequence-run assumption is two hDRG source samples/libraries, each sequenced twice. C1/C2 are technical runs, not independent biological replicates. The hDRG 1 and hDRG 2 biological relationship is described in the final study metadata.
+
+## Input contract and environment
+
+Render from the repository with a local copy of the corrected count matrix. Set `TG_CORRECTED_COUNTS` to that file. The notebook does not fetch protected data or install packages during rendering. It writes a separate `publication_notebook/output/` candidate set; it never overwrites `RealTGN.salmon.merged.gene_counts.tsv` or prior figure runs.
+
+```{r}
+#| label: setup
+suppressPackageStartupMessages({
+  library(edgeR)
+  library(ggplot2)
+  library(patchwork)
+})
+
+repo_root <- if (file.exists("RealTGN.salmon.merged.gene_counts.tsv")) {
+  normalizePath(".")
+} else if (file.exists("../RealTGN.salmon.merged.gene_counts.tsv")) {
+  normalizePath("..")
+} else {
+  stop("Render from the repository root or publication_notebook directory.")
+}
+
+corrected_path <- Sys.getenv("TG_CORRECTED_COUNTS", unset = "")
+if (!nzchar(corrected_path) || !file.exists(corrected_path)) {
+  stop("Set TG_CORRECTED_COUNTS to the downloaded paired-control gene-count TSV.")
+}
+corrected_path <- normalizePath(corrected_path)
+legacy_path <- file.path(repo_root, "RealTGN.salmon.merged.gene_counts.tsv")
+metadata_path <- file.path(
+  repo_root, "publication_notebook", "inputs", "sample_metadata_figure_context.csv"
+)
+genes_path <- file.path(
+  repo_root, "publication_notebook", "inputs", "gene_manifest_23.csv"
+)
+stopifnot(file.exists(legacy_path), file.exists(metadata_path), file.exists(genes_path))
+outdir <- file.path(repo_root, "publication_notebook", "output")
+dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+
+source_uri <- paste0(
+  "provided-corrected-count-matrix/",
+  "salmon.merged.gene_counts.tsv"
+)
+expected_corrected_sha256 <- "8e2a974c81b17c8a4988dfda79ec27a74d7ce8bb060219add3ec53688a9b24ad"
+file_sha256 <- function(path) digest::digest(file = path, algo = "sha256")
+observed_sha256 <- file_sha256(corrected_path)
+stopifnot(identical(observed_sha256, expected_corrected_sha256))
+
+input_manifest <- data.frame(
+  role = c("retained TGN counts", "corrected paired controls", "TGN sample map", "ordered gene set"),
+  source = c("legacy TGN count matrix", source_uri,
+             "sample metadata", "ordered gene manifest"),
+  sha256 = c(file_sha256(legacy_path), observed_sha256,
+             file_sha256(metadata_path), file_sha256(genes_path))
+)
+write.csv(input_manifest, file.path(outdir, "input_manifest.csv"), row.names = FALSE)
+knitr::kable(input_manifest)
+```
+
+The corrected-count SHA-256 is pinned to this run. Any replacement matrix requires an explicit review and hash update; a matching filename alone is not sufficient.
+
+## Biological units and count assembly
+
+The heatmap uses 12 matched TGN lot-week libraries (three lots × four weeks). The additional pilot W1 library is retained in the source matrix, but is not part of this matched design. The `hDRG` and `TAK2204464A` source columns are the two author-confirmed hDRG samples. C1/C2 are sequencing repeats, not replicate columns. Gene-ID and gene-name vectors must match exactly between old and corrected matrices; this notebook fails closed if they do not.
+
+```{r}
+#| label: assemble-counts
+meta <- read.csv(metadata_path, stringsAsFactors = FALSE, check.names = FALSE)
+lot_order <- c("TGN1003A", "TGN1028B", "TGN1215AvX")
+meta <- meta[
+  meta$sample_class == "TGN culture" &
+    meta$differentiation_lot %in% lot_order &
+    meta$rna_week_after_thaw %in% 1:4,
+  , drop = FALSE
+]
+meta <- meta[order(match(meta$differentiation_lot, lot_order),
+                   meta$rna_week_after_thaw), , drop = FALSE]
+stopifnot(nrow(meta) == 12L, !anyDuplicated(meta$sample_id),
+          all(table(meta$differentiation_lot) == 4L),
+          all(table(meta$rna_week_after_thaw) == 3L))
+tgn_ids <- meta$sample_id
+
+gene_manifest <- read.csv(genes_path, stringsAsFactors = FALSE, check.names = FALSE)
+genes <- gene_manifest$gene
+stopifnot(length(genes) == 23L, !anyDuplicated(genes))
+
+legacy <- read.delim(legacy_path, stringsAsFactors = FALSE, check.names = FALSE)
+corrected <- read.delim(corrected_path, stringsAsFactors = FALSE, check.names = FALSE)
+stopifnot(
+  nrow(legacy) == 62757L,
+  identical(legacy$gene_id, corrected$gene_id),
+  identical(legacy$gene_name, corrected$gene_name),
+  all(tgn_ids %in% names(legacy)),
+  identical(names(corrected), c("gene_id", "gene_name", "hDRG", "TAK2204464A")),
+  !anyDuplicated(legacy$gene_id)
+)
+
+sample_ids <- c(tgn_ids, "hDRG", "TAK2204464A")
+raw_values <- cbind(
+  legacy[, tgn_ids, drop = FALSE],
+  corrected[, c("hDRG", "TAK2204464A"), drop = FALSE]
+)
+counts_by_id <- as.matrix(raw_values)
+storage.mode(counts_by_id) <- "numeric"
+rownames(counts_by_id) <- legacy$gene_id
+stopifnot(identical(colnames(counts_by_id), sample_ids),
+          !anyNA(counts_by_id), all(is.finite(counts_by_id)),
+          all(counts_by_id >= 0))
+
+# Preserve the established figure's symbol aggregation, but make the step
+# explicit; no gene is silently mapped to a different annotation release.
+symbols <- toupper(trimws(legacy$gene_name))
+keep <- !is.na(symbols) & nzchar(symbols)
+counts <- rowsum(counts_by_id[keep, , drop = FALSE], symbols[keep], reorder = FALSE)
+stopifnot(all(genes %in% rownames(counts)),
+          identical(colnames(counts), sample_ids))
+
+design <- rbind(
+  data.frame(sample_id = tgn_ids, class = "TGN culture",
+             lot = meta$differentiation_lot,
+             week = meta$rna_week_after_thaw,
+             biological_label = tgn_ids),
+  data.frame(sample_id = c("hDRG", "TAK2204464A"),
+             class = c("hDRG reference", "hDRG reference"),
+             lot = NA_character_, week = NA_integer_,
+             biological_label = c("hDRG 1", "hDRG 2"))
+)
+stopifnot(identical(design$sample_id, colnames(counts)))
+write.csv(design[, c("sample_id", "biological_label", "class", "lot", "week")],
+          file.path(outdir, "sample_label_key.csv"), row.names = FALSE)
+knitr::kable(design)
+```
+
+## Normalization and Figure 2C values
+
+TMM is estimated jointly over the 12 TGN libraries plus the two hDRG reference samples. `edgeR::cpm(..., log=TRUE, prior.count=2)` gives the plotted log2 CPM. The color midpoint of 5 is a **display choice**, not zero expression or a fold-change null. Every tile uses the same numeric-to-color mapping. The displayed hDRG 2 column retains source ID `TAK2204464A` in the export table for traceability.
+
+```{r}
+#| label: normalize-and-export-values
+dge <- edgeR::DGEList(counts = counts)
+dge <- edgeR::calcNormFactors(dge, method = "TMM")
+logcpm <- edgeR::cpm(dge, log = TRUE, prior.count = 2)
+
+normalization <- data.frame(
+  design,
+  library_size = as.numeric(dge$samples$lib.size),
+  tmm_factor = as.numeric(dge$samples$norm.factors),
+  effective_library_size = as.numeric(dge$samples$lib.size * dge$samples$norm.factors)
+)
+write.csv(normalization, file.path(outdir, "normalization_samples.csv"), row.names = FALSE)
+
+values <- expand.grid(gene = genes, sample_id = sample_ids,
+                      stringsAsFactors = FALSE)
+values$gene <- factor(values$gene, levels = genes)
+values$sample_id <- factor(values$sample_id, levels = sample_ids)
+values <- values[order(values$gene, values$sample_id), , drop = FALSE]
+values$gene <- as.character(values$gene)
+values$sample_id <- as.character(values$sample_id)
+values$log2_cpm <- logcpm[cbind(match(values$gene, rownames(logcpm)),
+                                match(values$sample_id, colnames(logcpm)))]
+values$lot <- design$lot[match(values$sample_id, design$sample_id)]
+values$week <- design$week[match(values$sample_id, design$sample_id)]
+values$class <- design$class[match(values$sample_id, design$sample_id)]
+values$biological_label <- design$biological_label[match(values$sample_id, design$sample_id)]
+stopifnot(nrow(values) == 23L * 14L, !anyNA(values$log2_cpm))
+write.csv(values, file.path(outdir, "figure2c_expression_values_all_samples.csv"), row.names = FALSE)
+knitr::kable(normalization)
+```
+
+```{r}
+#| label: figure-2c-heatmap
+#| fig-width: 7.2
+#| fig-height: 3.25
+shown <- values
+shown$lot_index <- match(shown$lot, lot_order)
+shown$x <- ifelse(shown$sample_id == "hDRG", 14.8,
+                  ifelse(shown$sample_id == "TAK2204464A", 16.0,
+                         shown$week + (shown$lot_index - 1L) * 4.40))
+shown$gene <- factor(shown$gene, levels = rev(genes))
+shown$ink <- ifelse(shown$log2_cpm <= -1.5 | shown$log2_cpm >= 8.8,
+                   "white", "dark")
+stopifnot(nrow(shown) == 23L * 14L, all(is.finite(shown$x)))
+
+heat <- ggplot(shown, aes(x, gene, fill = log2_cpm)) +
+  geom_tile(width = 0.98, height = 0.98, colour = "white", linewidth = 0.3) +
+  geom_text(aes(label = sprintf("%.1f", log2_cpm), colour = ink),
+            size = 2.05, show.legend = FALSE) +
+  annotate("text", x = c(2.5, 6.9, 11.3, 15.4),
+           y = length(genes) + 1.1,
+           label = c(lot_order, "Human DRG reference"),
+           size = 2.45, fontface = "bold", colour = "#242424") +
+  geom_vline(xintercept = 13.8, colour = "#8A8A8A",
+             linewidth = 0.35, linetype = "dashed") +
+  scale_colour_manual(values = c(dark = "#222222", white = "#FFFFFF")) +
+  scale_fill_gradient2(low = "#2166AC", mid = "#F7F7F7", high = "#B2182B",
+                       midpoint = 5, limits = c(-4, 12), name = "log2 CPM") +
+  scale_x_continuous(
+    breaks = c(1:4, 1:4 + 4.4, 1:4 + 8.8, 14.8, 16.0),
+    labels = c(rep(paste0("W", 1:4), 3), "hDRG 1", "hDRG 2"),
+    expand = expansion(add = c(0.52, 0.7))
+  ) +
+  scale_y_discrete(expand = expansion(add = c(0.1, 1.45))) +
+  labs(x = NULL, y = NULL) +
+  theme_minimal(base_size = 8.5, base_family = "sans") +
+  theme(
+    panel.grid = element_blank(),
+    plot.background = element_rect(fill = "white", colour = NA),
+    axis.text = element_text(colour = "#242424", size = 7.6),
+    axis.title = element_blank(),
+    legend.position = "right",
+    legend.text = element_text(size = 7),
+    legend.title = element_text(size = 7.6),
+    plot.margin = margin(8, 5, 4, 5)
+  )
+heat
+
+ggsave(file.path(outdir, "figure2c_heatmap.pdf"), heat,
+       width = 7.2, height = 3.25, units = "in", device = cairo_pdf)
+grDevices::svg(file.path(outdir, "figure2c_heatmap.svg"),
+               width = 7.2, height = 3.25)
+print(heat)
+grDevices::dev.off()
+ggsave(file.path(outdir, "figure2c_heatmap.png"), heat,
+       width = 7.2, height = 3.25, units = "in", dpi = 600, type = "cairo-png")
+```
+
+## Figure 2D: donor-supported human TG reference UMAP
+
+This is a reference-only panel from GSE197289 nuclei; it does not use the corrected bulk controls. Single-cluster families receive shortened labels, and unresolved nuclei remain gray. The UMAP is descriptive: its distances are not developmental distances.
+
+```{r}
+#| label: reference-umap
+#| fig-width: 3.35
+#| fig-height: 3.2
+stopifnot(requireNamespace("Seurat", quietly = TRUE),
+          requireNamespace("ggrepel", quietly = TRUE))
+reference_object_path <- file.path(
+  repo_root, "results", "consensus_identity",
+  "GSE197289_human_TG_neurons_consensus.rds"
+)
+stopifnot(file.exists(reference_object_path))
+reference_object <- readRDS(reference_object_path)
+umap_coordinates <- as.data.frame(Seurat::Embeddings(reference_object, "umap_sct"))
+names(umap_coordinates)[1:2] <- c("x", "y")
+umap_coordinates$cell <- rownames(umap_coordinates)
+cell_metadata <- reference_object[[]]
+cell_metadata$cell <- rownames(cell_metadata)
+umap_coordinates <- merge(
+  umap_coordinates,
+  cell_metadata[, c("cell", "consensus_status", "consensus_identity")],
+  by = "cell", sort = FALSE
+)
+umap_coordinates$identity <- ifelse(
+  umap_coordinates$consensus_status == "Donor-supported anchor",
+  as.character(umap_coordinates$consensus_identity), "Unresolved"
+)
+identity_ids <- sort(setdiff(unique(umap_coordinates$identity), "Unresolved"))
+family_colors <- c(cLTMR = "#542788", NF1 = "#D73027", NF2 = "#F16913",
+                   NF3 = "#8C510A", NP = "#1B7837", PEP = "#762A83",
+                   SST = "#2166AC", TRPM8 = "#1B9E77")
+short_identity <- function(ids, all_ids) {
+  vapply(ids, function(id) {
+    family <- sub("__.*$", "", id)
+    if (sum(startsWith(all_ids, paste0(family, "__"))) == 1L) {
+      family
+    } else {
+      sub("__", "-", id, fixed = TRUE)
+    }
+  }, character(1))
+}
+identity_palette <- setNames(rep(NA_character_, length(identity_ids)), identity_ids)
+for (family in unique(sub("__.*$", "", identity_ids))) {
+  ix <- which(startsWith(identity_ids, paste0(family, "__")))
+  base <- family_colors[[family]]
+  stopifnot(!is.null(base))
+  identity_palette[ix] <- if (length(ix) == 1L) base else
+    grDevices::colorRampPalette(c("#CACACA", base))(length(ix) + 1L)[-1L]
+}
+label_centers <- do.call(rbind, lapply(identity_ids, function(id) {
+  cells <- umap_coordinates[umap_coordinates$identity == id, , drop = FALSE]
+  data.frame(identity = id, x = median(cells$x), y = median(cells$y),
+             label = short_identity(id, identity_ids))
+}))
+write.csv(data.frame(source_identity = identity_ids,
+                     plot_label = short_identity(identity_ids, identity_ids),
+                     color = unname(identity_palette[identity_ids])),
+          file.path(outdir, "reference_label_key.csv"), row.names = FALSE)
+
+reference_umap <- ggplot() +
+  geom_point(data = umap_coordinates[umap_coordinates$identity == "Unresolved", ],
+             aes(x, y), colour = "#C9C9C9", size = 0.13, alpha = 0.48) +
+  geom_point(data = umap_coordinates[umap_coordinates$identity != "Unresolved", ],
+             aes(x, y, colour = identity), size = 0.16, alpha = 0.80) +
+  ggrepel::geom_label_repel(
+    data = label_centers, aes(x, y, label = label),
+    colour = "#1A1A1A", fill = "white", size = 2.55,
+    label.size = 0.10, label.padding = grid::unit(0.045, "lines"),
+    box.padding = 0.13, point.padding = 0.04,
+    min.segment.length = 0, max.overlaps = Inf, seed = 197289,
+    show.legend = FALSE
+  ) +
+  scale_colour_manual(values = identity_palette, guide = "none") +
+  coord_equal() + labs(x = "UMAP 1", y = "UMAP 2") +
+  theme_minimal(base_size = 8.5, base_family = "sans") +
+  theme(panel.grid = element_blank(),
+        axis.line = element_line(colour = "#C8C8C8", linewidth = 0.24),
+        axis.ticks = element_line(colour = "#C8C8C8", linewidth = 0.22),
+        axis.text = element_text(size = 7.0, colour = "#686868"),
+        axis.title = element_text(size = 8.2),
+        plot.background = element_rect(fill = "white", colour = NA),
+        panel.background = element_rect(fill = "white", colour = NA),
+        plot.margin = margin(2, 2, 2, 2))
+reference_umap
+ggsave(file.path(outdir, "figure2d_reference_umap.pdf"), reference_umap,
+       width = 3.25, height = 5.2, units = "in", device = cairo_pdf)
+grDevices::svg(file.path(outdir, "figure2d_reference_umap.svg"),
+               width = 3.25, height = 5.2)
+print(reference_umap)
+grDevices::dev.off()
+ggsave(file.path(outdir, "figure2d_reference_umap.png"), reference_umap,
+       width = 3.25, height = 5.2, units = "in", dpi = 600, type = "cairo-png")
+```
+
+## Supplement S2A: reference marker expression in UMAP space
+
+The 16 prespecified marker genes are shown in the same UMAP coordinates as Figure 2D. Values come from the reference object's SCT normalized `data` layer. For legibility, each gene is independently divided by its 99th percentile among nuclei and capped at 1; colors therefore show **relative SCT-normalized expression within each gene** (0 to that gene's 99th percentile), not comparable absolute expression across genes. Gray points have zero expression. The exact normalized values and display caps are exported.
+
+```{r}
+#| label: s2a-marker-umap
+#| fig-width: 6.8
+#| fig-height: 7.3
+marker_umap_genes <- c("RBFOX3", "SCN9A", "SCN10A", "SCN11A",
+                       "NTRK1", "TRPV1", "CALCA", "P2RX3",
+                       "RET", "GFRA3", "NEFH", "PIEZO2",
+                       "NTRK2", "NTRK3", "TRPM8", "SST")
+marker_matrix <- Seurat::GetAssayData(reference_object, assay = "SCT", layer = "data")
+stopifnot(all(marker_umap_genes %in% rownames(marker_matrix)),
+          all(umap_coordinates$cell %in% colnames(marker_matrix)))
+marker_matrix <- as.matrix(marker_matrix[marker_umap_genes,
+                                         umap_coordinates$cell, drop = FALSE])
+marker_caps <- apply(marker_matrix, 1, function(x) as.numeric(quantile(x, 0.99)))
+stopifnot(all(marker_caps > 0))
+marker_umap_values <- do.call(rbind, lapply(marker_umap_genes, function(gene) {
+  data.frame(gene = gene, cell = umap_coordinates$cell,
+             x = umap_coordinates$x, y = umap_coordinates$y,
+             sct_log_expression = unname(marker_matrix[gene, ]),
+             display_cap = marker_caps[[gene]],
+             display_intensity = pmin(1, unname(marker_matrix[gene, ]) / marker_caps[[gene]]))
+}))
+stopifnot(nrow(marker_umap_values) == length(marker_umap_genes) * nrow(umap_coordinates))
+write.csv(marker_umap_values, file.path(outdir, "s2a_marker_umap_values.csv"), row.names = FALSE)
+write.csv(data.frame(gene = marker_umap_genes, sct_log_expression_p99 = marker_caps),
+          file.path(outdir, "s2a_marker_umap_display_caps.csv"), row.names = FALSE)
+marker_umap_values$gene <- factor(marker_umap_values$gene, levels = marker_umap_genes)
+marker_umap_values <- marker_umap_values[order(marker_umap_values$display_intensity), ]
+marker_umap_plot <- ggplot(marker_umap_values, aes(x, y, colour = display_intensity)) +
+  geom_point(size = 0.11, alpha = 0.9) +
+  facet_wrap(~ gene, ncol = 4) +
+  scale_colour_gradient(low = "#E5E5E5", high = "#A50026", limits = c(0, 1),
+                        name = "Relative SCT-normalized\nexpression (within gene)") +
+  coord_equal() + labs(x = "UMAP 1", y = "UMAP 2") +
+  theme_minimal(base_size = 8, base_family = "sans") +
+  theme(panel.grid = element_blank(),
+        axis.text = element_blank(), axis.ticks = element_blank(),
+        axis.title = element_text(size = 7),
+        axis.line = element_line(colour = "#C8C8C8", linewidth = 0.2),
+        strip.text = element_text(size = 7.2, face = "italic"),
+        panel.spacing = grid::unit(0.10, "cm"),
+        legend.position = "bottom",
+        legend.direction = "horizontal",
+        legend.title = element_text(size = 7),
+        legend.text = element_text(size = 6.5),
+        plot.background = element_rect(fill = "white", colour = NA))
+marker_umap_plot
+ggsave(file.path(outdir, "s2a_marker_umap_grid.pdf"), marker_umap_plot,
+       width = 6.8, height = 7.3, units = "in", device = cairo_pdf)
+grDevices::svg(file.path(outdir, "s2a_marker_umap_grid.svg"), width = 6.8, height = 7.3)
+print(marker_umap_plot)
+grDevices::dev.off()
+ggsave(file.path(outdir, "s2a_marker_umap_grid.png"), marker_umap_plot,
+       width = 6.8, height = 7.3, units = "in", dpi = 600, type = "cairo-png")
+rm(cell_metadata, umap_coordinates, marker_matrix, marker_umap_values)
+gc(verbose = FALSE)
+```
+
+## Supplement S2B: human TG reference expression
+
+For each gene, donor-pseudobulk means are averaged within each refined identity and centered on that gene's mean across displayed identities. **Tile color** is this gene-wise deviation; **printed values** are actual mean log2 CPM to one decimal. Genes are columns. Refined cell identities are rows, ordered by hierarchical clustering of their gene-centered expression profiles. This is not the same absolute color scale as Figure 2C. S2B is the same height as the 4 × 4 auxiliary reference marker UMAP.
+
+```{r}
+#| label: reference-expression
+#| fig-width: 6.8
+#| fig-height: 7.3
+reference_expression_path <- file.path(
+  repo_root, "results", "pseudobulk", "GSE197289_TG_neuron_donor_subtype_logCPM.csv"
+)
+reference_metadata_path <- file.path(
+  repo_root, "results", "pseudobulk", "GSE197289_TG_neuron_donor_subtype_metadata.csv"
+)
+stopifnot(file.exists(reference_expression_path), file.exists(reference_metadata_path))
+reference_expression <- as.matrix(
+  read.csv(reference_expression_path, row.names = 1, check.names = FALSE)
+)
+reference_metadata <- read.csv(reference_metadata_path, stringsAsFactors = FALSE)
+reference_metadata <- reference_metadata[reference_metadata$include_pseudobulk, , drop = FALSE]
+reference_genes <- c("RBFOX3", "SCN10A", "SCN9A", "SCN11A", "NTRK1",
+                     "NTRK2", "NTRK3", "TRPV1", "TRPM8", "P2RX3", "PIEZO2")
+stopifnot(all(reference_genes %in% rownames(reference_expression)),
+          all(reference_metadata$pseudobulk_id %in% colnames(reference_expression)))
+reference_ids <- sort(unique(reference_metadata$refined_neuronal_label))
+reference_means <- sapply(reference_ids, function(id) {
+  cols <- reference_metadata$pseudobulk_id[
+    reference_metadata$refined_neuronal_label == id]
+  rowMeans(reference_expression[reference_genes, cols, drop = FALSE])
+})
+reference_values <- data.frame(
+  gene = rep(reference_genes, times = length(reference_ids)),
+  identity = rep(reference_ids, each = length(reference_genes)),
+  mean_log2_cpm = as.vector(reference_means)
+)
+cluster_matrix <- sweep(reference_means, 1, rowMeans(reference_means), "-")
+cluster_order <- hclust(dist(t(cluster_matrix)))$labels[
+  hclust(dist(t(cluster_matrix)))$order]
+stopifnot(setequal(cluster_order, reference_ids))
+reference_values$plot_label <- factor(
+  short_identity(reference_values$identity, reference_ids),
+  levels = rev(short_identity(cluster_order, reference_ids))
+)
+reference_values$gene_mean_deviation <- reference_values$mean_log2_cpm -
+  rowMeans(reference_means)[reference_values$gene]
+reference_values$identity_row_order <- match(reference_values$identity, cluster_order)
+reference_values$gene_column_order <- match(reference_values$gene, reference_genes)
+stopifnot(all(is.finite(reference_values$gene_mean_deviation)))
+write.csv(reference_values, file.path(outdir, "s2b_reference_expression_values.csv"),
+          row.names = FALSE)
+reference_values$gene <- factor(reference_values$gene, levels = reference_genes)
+reference_limit <- max(1.5, ceiling(max(abs(reference_values$gene_mean_deviation)) * 2) / 2)
+reference_values$ink <- ifelse(
+  abs(reference_values$gene_mean_deviation) >= 0.62 * reference_limit,
+  "white", "#1B1B1B"
+)
+reference_plot <- ggplot(reference_values,
+                         aes(gene, plot_label, fill = gene_mean_deviation)) +
+  geom_tile(colour = "white", linewidth = 0.28) +
+  geom_text(aes(label = sprintf("%.1f", mean_log2_cpm), colour = ink),
+            size = 2.25, show.legend = FALSE) +
+  scale_colour_identity() +
+  scale_fill_gradient2(low = "#2166AC", mid = "#F7F7F7", high = "#B2182B",
+                       limits = c(-reference_limit, reference_limit), midpoint = 0,
+                       name = "Color: log2 CPM\nfrom gene mean") +
+  labs(x = NULL, y = NULL) +
+  theme_minimal(base_size = 8.5, base_family = "sans") +
+  theme(panel.grid = element_blank(),
+        plot.background = element_rect(fill = "white", colour = NA),
+        panel.background = element_rect(fill = "white", colour = NA),
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 7.6),
+        axis.text.y = element_text(size = 7.3),
+        legend.position = "bottom",
+        legend.direction = "horizontal",
+        legend.title = element_text(size = 7.8),
+        legend.text = element_text(size = 7.2))
+reference_plot
+ggsave(file.path(outdir, "s2b_reference_expression.pdf"), reference_plot,
+       width = 6.8, height = 7.3, units = "in", device = cairo_pdf)
+grDevices::svg(file.path(outdir, "s2b_reference_expression.svg"),
+               width = 6.8, height = 7.3)
+print(reference_plot)
+grDevices::dev.off()
+ggsave(file.path(outdir, "s2b_reference_expression.png"), reference_plot,
+       width = 6.8, height = 7.3, units = "in", dpi = 600, type = "cairo-png")
+```
+
+## Supplemental Figure 1F: refined identity marker expression
+
+This panel displays SCT assay `data` values for the donor-supported refined neuronal identities. Dot color is the mean SCT value among nuclei in an identity; dot area shows the percentage of nuclei with a value above zero. These are descriptive cluster summaries, not tests of differential expression. The companion table also reports each donor separately.
+
+```{r}
+#| label: s1f-refined-marker-expression
+#| fig-width: 8.2
+#| fig-height: 8.3
+marker_genes <- c("CASQ2", "P2RY1", "NTRK3", "PVALB",
+                  "NTRK2", "PIEZO2", "NTRK1", "SCN10A")
+stopifnot(all(marker_genes %in% rownames(reference_object[["SCT"]])))
+marker_meta <- reference_object[[]]
+selected_cells <- rownames(marker_meta)[
+  marker_meta$consensus_status == "Donor-supported anchor"
+]
+marker_matrix <- as.matrix(Seurat::GetAssayData(
+  reference_object, assay = "SCT", layer = "data"
+)[marker_genes, selected_cells, drop = FALSE])
+marker_meta <- marker_meta[selected_cells, , drop = FALSE]
+cluster_order <- c("cLTMR__SC01", paste0("NF1__SC0", 1:3),
+                   paste0("NF2__SC0", 1:3), paste0("NF3__SC0", 1:3),
+                   "NP__SC01", paste0("PEP__SC0", 1:4),
+                   paste0("SST__SC0", 1:2), "TRPM8__SC01")
+stopifnot(setequal(unique(marker_meta$consensus_identity), cluster_order),
+          length(selected_cells) == 3662L)
+marker_values <- do.call(rbind, lapply(cluster_order, function(identity) {
+  cells <- marker_meta$consensus_identity == identity
+  data.frame(identity = identity, gene = marker_genes,
+             n_nuclei = sum(cells),
+             n_donors = length(unique(marker_meta$donor[cells])),
+             mean_sct_data = rowMeans(marker_matrix[, cells, drop = FALSE]),
+             percent_positive = rowMeans(marker_matrix[, cells, drop = FALSE] > 0) * 100)
+}))
+marker_values$family <- sub("__.*", "", marker_values$identity)
+write.csv(marker_values, file.path(outdir, "s1f_refined_marker_expression_values.csv"),
+          row.names = FALSE)
+marker_donor_values <- do.call(rbind, lapply(cluster_order, function(identity) {
+  do.call(rbind, lapply(sort(unique(marker_meta$donor[
+    marker_meta$consensus_identity == identity])), function(donor) {
+    cells <- marker_meta$consensus_identity == identity & marker_meta$donor == donor
+    data.frame(identity = identity, donor = as.character(donor),
+               gene = marker_genes, n_nuclei = sum(cells),
+               mean_sct_data = rowMeans(marker_matrix[, cells, drop = FALSE]),
+               percent_positive = rowMeans(marker_matrix[, cells, drop = FALSE] > 0) * 100)
+  }))
+}))
+write.csv(marker_donor_values,
+          file.path(outdir, "s1f_refined_marker_expression_by_donor.csv"),
+          row.names = FALSE)
+marker_values$identity <- factor(marker_values$identity, levels = rev(cluster_order))
+marker_values$gene <- factor(marker_values$gene, levels = marker_genes)
+marker_plot <- ggplot(marker_values, aes(gene, identity)) +
+  geom_point(aes(size = percent_positive, color = mean_sct_data)) +
+  scale_size_area(max_size = 6, limits = c(0, 100), name = "Nuclei > 0 (%)") +
+  scale_color_gradient(low = "#E6E6E6", high = "#B2182B",
+                       name = "Mean SCT data value") +
+  labs(x = NULL, y = "Refined cluster identity") +
+  theme_minimal(base_size = 9, base_family = "sans") +
+  theme(panel.grid = element_line(color = "#E8E8E8", linewidth = 0.2),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.text.y = element_text(size = 7.3),
+        legend.position = "top",
+        plot.background = element_rect(fill = "white", colour = NA),
+        panel.background = element_rect(fill = "white", colour = NA))
+marker_plot
+ggsave(file.path(outdir, "s1f_refined_marker_expression.pdf"), marker_plot,
+       width = 8.2, height = 8.3, units = "in", device = cairo_pdf)
+grDevices::svg(file.path(outdir, "s1f_refined_marker_expression.svg"),
+               width = 8.2, height = 8.3)
+print(marker_plot)
+grDevices::dev.off()
+ggsave(file.path(outdir, "s1f_refined_marker_expression.png"), marker_plot,
+       width = 8.2, height = 8.3, units = "in", dpi = 600, type = "cairo-png")
+rm(reference_object, marker_matrix, marker_meta)
+gc(verbose = FALSE)
+```
+
+The NF1 family should be described as higher in NTRK1 and SCN10A **relative to NF2 and NF3 in this reference**, not as uniformly high across all neuronal families. NF1-SC02 is lower than the other NF1 subclusters for both genes.
+
+## Corrected joint reference/bulk space
+
+The downstream signature and conditioning calculations use the same 12 matched TGN libraries and two corrected hDRG sources as Figure 2C. The frozen Ensembl-to-symbol map from the earlier analysis is reused because the corrected matrix has identical GENCODE v43 gene IDs. This is the actual joint normalization—not a redraw of the July NNLS CSV.
+
+```{r}
+#| label: joint-reference-normalization
+stopifnot(requireNamespace("nnls", quietly = TRUE))
+id_map_path <- file.path(repo_root, "results", "deconv_rerun_expanded",
+                         "ensembl_to_symbol_id_map.csv")
+reference_dge_path <- file.path(repo_root, "results", "pseudobulk",
+                                "GSE197289_TG_combined_reference_edgeR_dge.rds")
+combined_metadata_path <- file.path(repo_root, "results", "pseudobulk",
+                                    "GSE197289_TG_combined_reference_metadata.csv")
+marker_manifest_path <- file.path(repo_root, "results", "marker_refinement",
+                                  "GSE197289_TG_expanded_marker_manifest.csv")
+original_manifest_path <- file.path(repo_root, "results", "pseudobulk",
+                                    "GSE197289_TG_combined_marker_manifest.csv")
+stopifnot(all(file.exists(c(id_map_path, reference_dge_path,
+                            combined_metadata_path, marker_manifest_path,
+                            original_manifest_path))))
+
+id_map <- read.csv(id_map_path, stringsAsFactors = FALSE)
+stopifnot(identical(id_map$ensembl_versioned, rownames(counts_by_id)),
+          !anyNA(id_map$resolved_symbol))
+incoming_symbols <- toupper(id_map$resolved_symbol)
+incoming_by_symbol <- rowsum(counts_by_id, incoming_symbols, reorder = FALSE)
+combined_dge <- readRDS(reference_dge_path)
+combined_metadata <- read.csv(combined_metadata_path, stringsAsFactors = FALSE)
+reference_gene_key <- toupper(rownames(combined_dge$counts))
+stopifnot(!anyDuplicated(reference_gene_key),
+          !anyDuplicated(rownames(incoming_by_symbol)))
+shared_genes <- intersect(reference_gene_key, rownames(incoming_by_symbol))
+stopifnot(length(shared_genes) > 18000L)
+reference_counts <- combined_dge$counts[
+  match(shared_genes, reference_gene_key), , drop = FALSE
+]
+incoming_counts <- incoming_by_symbol[
+  match(shared_genes, rownames(incoming_by_symbol)), , drop = FALSE
+]
+rownames(reference_counts) <- shared_genes
+rownames(incoming_counts) <- shared_genes
+reference_sample_ids <- combined_metadata$pseudobulk_id
+stopifnot(identical(colnames(reference_counts), reference_sample_ids),
+          identical(colnames(incoming_counts), sample_ids))
+joint_counts <- cbind(reference_counts, incoming_counts)
+joint_dge <- edgeR::DGEList(counts = joint_counts)
+joint_dge <- edgeR::calcNormFactors(joint_dge, method = "TMM")
+joint_logcpm <- edgeR::cpm(joint_dge, log = TRUE, prior.count = 2)
+write.csv(data.frame(sample_id = colnames(joint_counts),
+                     library_size = joint_dge$samples$lib.size,
+                     tmm_factor = joint_dge$samples$norm.factors),
+          file.path(outdir, "joint_normalization_samples.csv"), row.names = FALSE)
+cat("Shared genes:", length(shared_genes),
+    "| reference pseudobulks:", length(reference_sample_ids),
+    "| incoming libraries:", length(sample_ids), "\n")
+```
+
+## Figure 2F and S2C: refined signatures and conditioning
+
+The donor-refined panel is the frozen `use_in_deconvolution` subset of the marker manifest intersected with the corrected joint space: **788 genes**. Marker refinement considered positive and anti-markers; the NNLS fit itself uses the eligible positive/deconvolution genes. NNLS coefficients are normalized to sum to one within each sample. They are **relative transcriptional signature contributions, not cell fractions**. The original 79-gene manifest supplies the S2C conditioning comparison. The detailed category table retains zero-valued identities. Main Figure 2F uses the same 0–100% stacked-bar encoding and colors as S2E, with only the refined 788-gene fit and the three TGN lots arranged as columns.
+
+```{r}
+#| label: signature-calculation
+marker_manifest <- read.csv(marker_manifest_path, stringsAsFactors = FALSE)
+original_manifest <- read.csv(original_manifest_path, stringsAsFactors = FALSE)
+signed_genes <- unique(marker_manifest$gene[
+  marker_manifest$gene %in% rownames(joint_logcpm) &
+    (is.na(marker_manifest$use_in_deconvolution) |
+       marker_manifest$use_in_deconvolution)
+])
+original_genes <- unique(original_manifest$gene[
+  original_manifest$gene %in% rownames(joint_logcpm)
+])
+stopifnot(length(signed_genes) == 788L, length(original_genes) == 79L)
+write.csv(data.frame(gene = signed_genes),
+          file.path(outdir, "signed_refined_788_genes.csv"), row.names = FALSE)
+
+identity_order <- unique(combined_metadata$reference_label)
+build_signature <- function(selected_genes) {
+  reference_linear <- 2^joint_logcpm[
+    selected_genes, reference_sample_ids, drop = FALSE
+  ]
+  sig <- sapply(identity_order, function(identity) {
+    cols <- combined_metadata$pseudobulk_id[
+      combined_metadata$reference_label == identity
+    ]
+    if (length(cols) == 1L) reference_linear[, cols] else
+      rowMeans(reference_linear[, cols, drop = FALSE])
+  })
+  colnames(sig) <- identity_order
+  sig
+}
+signed_signature <- build_signature(signed_genes)
+original_signature <- build_signature(original_genes)
+stopifnot(identical(rownames(signed_signature), signed_genes),
+          identical(colnames(signed_signature), identity_order))
+
+fit_signature <- function(sample_id) {
+  target <- 2^joint_logcpm[signed_genes, sample_id]
+  fit <- nnls::nnls(signed_signature, as.numeric(target))
+  coefficient <- pmax(fit$x, 0)
+  stopifnot(sum(coefficient) > 0)
+  coefficient / sum(coefficient)
+}
+coefficients <- sapply(sample_ids, fit_signature)
+rownames(coefficients) <- identity_order
+stopifnot(all(abs(colSums(coefficients) - 1) < 1e-8),
+          all(coefficients >= 0))
+coefficients_long <- data.frame(
+  sample_id = rep(colnames(coefficients), each = nrow(coefficients)),
+  reference_identity = rep(rownames(coefficients), times = ncol(coefficients)),
+  coefficient = as.vector(coefficients)
+)
+write.csv(coefficients_long,
+          file.path(outdir, "figure2f_identity_coefficients_all_samples.csv"),
+          row.names = FALSE)
+
+non_neuronal <- unique(combined_metadata$reference_label[
+  combined_metadata$reference_level == "Broad non-neuronal"
+])
+category_of <- function(identity) {
+  ifelse(identity == "NF2__SC03", "A-beta-LTMR-like",
+  ifelse(identity == "NF3__SC02", "A-delta-LTMR-like",
+  ifelse(identity == "cLTMR__SC01", "C-LTMR-like",
+  ifelse(identity %in% non_neuronal, "Non-neuronal / off-target",
+         "Other neuronal"))))
+}
+coefficients_long$category <- category_of(coefficients_long$reference_identity)
+category_values <- aggregate(
+  coefficient ~ sample_id + category, coefficients_long, sum
+)
+names(category_values)[names(category_values) == "coefficient"] <- "contribution"
+category_values$specimen_id <- design$lot[
+  match(category_values$sample_id, design$sample_id)
+]
+category_values$week <- design$week[
+  match(category_values$sample_id, design$sample_id)
+]
+write.csv(category_values,
+          file.path(outdir, "figure2f_relative_signature_values.csv"), row.names = FALSE)
+stopifnot(all(abs(aggregate(contribution ~ sample_id,
+                            category_values[category_values$sample_id %in% tgn_ids, ],
+                            sum)$contribution - 1) < 1e-8))
+
+compute_vif <- function(signature) {
+  x <- log2(signature + 1)
+  vapply(seq_len(ncol(x)), function(i) {
+    fit <- stats::lm(x[, i] ~ x[, -i, drop = FALSE])
+    r2 <- summary(fit)$r.squared
+    if (r2 >= 0.999999) Inf else 1 / (1 - r2)
+  }, numeric(1))
+}
+vif_table <- data.frame(
+  reference_identity = identity_order,
+  vif_original = compute_vif(original_signature),
+  vif_signed_refined = compute_vif(signed_signature)
+)
+stopifnot(all(is.finite(vif_table$vif_original)),
+          all(is.finite(vif_table$vif_signed_refined)))
+write.csv(vif_table, file.path(outdir, "s2c_signature_vif.csv"), row.names = FALSE)
+knitr::kable(data.frame(manifest = c("Original", "Signed refined"),
+                        genes = c(length(original_genes), length(signed_genes)),
+                        median_vif = c(median(vif_table$vif_original),
+                                       median(vif_table$vif_signed_refined))))
+```
+
+```{r}
+#| label: figure-2f-refined-signatures
+#| fig-width: 4.7
+#| fig-height: 1.9
+category_levels <- c("A-beta-LTMR-like", "Other neuronal", "C-LTMR-like",
+                     "A-delta-LTMR-like", "Non-neuronal / off-target")
+main_categories <- category_values[
+  category_values$sample_id %in% tgn_ids &
+    category_values$category %in% c("A-beta-LTMR-like", "C-LTMR-like"),
+  c("sample_id", "specimen_id", "week", "category", "contribution"),
+  drop = FALSE
+]
+remaining <- aggregate(contribution ~ sample_id + specimen_id + week,
+                       main_categories, sum)
+remaining$contribution <- 1 - remaining$contribution
+stopifnot(nrow(main_categories) == 24L, nrow(remaining) == 12L,
+          all(remaining$contribution >= -1e-10),
+          max(remaining$contribution) < 0.02)
+remaining$contribution <- pmax(remaining$contribution, 0)
+remaining$category <- "Other fitted"
+main_categories <- rbind(main_categories, remaining[, names(main_categories)])
+main_categories$group <- factor(main_categories$category,
+  levels = c("A-beta-LTMR-like", "C-LTMR-like", "Other fitted"))
+main_categories$lot <- factor(main_categories$specimen_id, levels = lot_order)
+signature_bar_plot <- function(plot_values, facets, legend_position = "bottom") {
+  ggplot(plot_values, aes(factor(week), contribution, fill = group)) +
+    geom_col(width = 0.8, colour = "white", linewidth = 0.12) +
+    facet_grid(facets) +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                       expand = expansion(mult = c(0, 0.01))) +
+    scale_fill_manual(values = c("A-beta-LTMR-like" = "#D73027",
+                                 "C-LTMR-like" = "#542788",
+                                 "Other fitted" = "#969696"),
+                      breaks = c("A-beta-LTMR-like", "C-LTMR-like", "Other fitted"),
+                      labels = c("Aβ-LTMR-like", "C-LTMR-like", "Other fitted"),
+                      name = NULL) +
+    coord_cartesian(ylim = c(0, 1)) +
+    labs(x = "Week", y = "Relative fitted weight") +
+    theme_minimal(base_size = 8.5, base_family = "sans") +
+    theme(panel.grid = element_blank(),
+          strip.text = element_text(size = 7),
+          axis.text = element_text(size = 6.5),
+          legend.position = legend_position,
+          legend.text = element_text(size = 6.2),
+          legend.key.width = grid::unit(0.26, "cm"),
+          plot.background = element_rect(fill = "white", colour = NA),
+          panel.background = element_rect(fill = "white", colour = NA)) +
+    guides(fill = guide_legend(nrow = 1, byrow = TRUE))
+}
+relative_signatures <- signature_bar_plot(main_categories, ~ lot, legend_position = "top")
+relative_signatures
+ggsave(file.path(outdir, "figure2f_refined_788_signature.pdf"),
+       relative_signatures, width = 4.7, height = 1.9,
+       units = "in", device = cairo_pdf)
+grDevices::svg(file.path(outdir, "figure2f_refined_788_signature.svg"),
+               width = 4.7, height = 1.9)
+print(relative_signatures)
+grDevices::dev.off()
+ggsave(file.path(outdir, "figure2f_refined_788_signature.png"),
+       relative_signatures, width = 4.7, height = 1.9,
+       units = "in", dpi = 600, type = "cairo-png")
+```
+
+```{r}
+#| label: s2c-vif
+#| fig-width: 3.25
+#| fig-height: 5.2
+vif_long <- rbind(
+  data.frame(identity = vif_table$reference_identity,
+             manifest = "Original", vif = vif_table$vif_original),
+  data.frame(identity = vif_table$reference_identity,
+             manifest = "Signed refined", vif = vif_table$vif_signed_refined)
+)
+vif_long$plot_label <- short_identity(vif_long$identity, identity_order)
+vif_long$plot_label <- factor(
+  vif_long$plot_label,
+  levels = short_identity(vif_table$reference_identity[
+    order(vif_table$vif_signed_refined)], identity_order)
+)
+vif_plot <- ggplot(vif_long, aes(plot_label, vif, fill = manifest)) +
+  geom_col(position = position_dodge(width = 0.75), width = 0.70) +
+  geom_hline(yintercept = 10, linetype = "dashed",
+             colour = "#B2182B", linewidth = 0.4) +
+  coord_flip() +
+  scale_fill_manual(values = c(Original = "#969696",
+                               `Signed refined` = "#2166AC"), name = NULL) +
+  labs(x = NULL, y = "Variance inflation factor") +
+  theme_minimal(base_size = 8.5, base_family = "sans") +
+  theme(panel.grid = element_blank(),
+        plot.background = element_rect(fill = "white", colour = NA),
+        panel.background = element_rect(fill = "white", colour = NA),
+        axis.text.y = element_text(size = 6.2),
+        legend.position = "inside",
+        legend.position.inside = c(0.98, 0.04),
+        legend.justification = c(1, 0),
+        legend.direction = "horizontal",
+        legend.background = element_rect(fill = "white", colour = NA),
+        legend.text = element_text(size = 6.2),
+        legend.key.width = grid::unit(0.28, "cm")) +
+  guides(fill = guide_legend(nrow = 1, byrow = TRUE))
+vif_plot
+ggsave(file.path(outdir, "s2c_signature_conditioning.pdf"), vif_plot,
+       width = 3.35, height = 3.2, units = "in", device = cairo_pdf)
+grDevices::svg(file.path(outdir, "s2c_signature_conditioning.svg"),
+               width = 3.35, height = 3.2)
+print(vif_plot)
+grDevices::dev.off()
+ggsave(file.path(outdir, "s2c_signature_conditioning.png"), vif_plot,
+       width = 3.35, height = 3.2, units = "in", dpi = 600, type = "cairo-png")
+```
+
+## Figure 2E: corrected joint seven-PC t-SNE
+
+This repeats the archived seven-PC embedding calculation with the corrected 14-sample bulk matrix: TMM-normalize the neuronal reference plus bulk jointly, select the 2,000 highest-variance genes **within the reference**, fit PCA on reference samples, project bulk samples using the frozen reference center/loadings, then run exact t-SNE on the combined seven-PC scores (perplexity 10, 2,000 iterations, seed 197296). TGN points are labeled by week; the reference pseudobulks nearest the TGN points in the plotted coordinates receive the same shortened identity labels as the UMAP. This proximity rule selects visual labels only. Coordinates are descriptive and cannot be interpreted as maturation distances, lineage paths, or quantitative subtype similarity.
+
+```{r}
+#| label: joint-tsne-calculate
+stopifnot(requireNamespace("Rtsne", quietly = TRUE))
+neuronal_dge_path <- file.path(repo_root, "results", "pseudobulk",
+                               "GSE197289_TG_neuron_donor_subtype_edgeR_dge.rds")
+neuronal_metadata_path <- file.path(repo_root, "results", "pseudobulk",
+                                    "GSE197289_TG_neuron_donor_subtype_metadata.csv")
+stopifnot(file.exists(neuronal_dge_path), file.exists(neuronal_metadata_path))
+neuronal_dge <- readRDS(neuronal_dge_path)
+neuronal_metadata <- read.csv(neuronal_metadata_path, stringsAsFactors = FALSE)
+neuronal_ids <- neuronal_metadata$pseudobulk_id
+stopifnot(identical(colnames(neuronal_dge$counts), neuronal_ids))
+
+neuronal_gene_key <- toupper(rownames(neuronal_dge$counts))
+neuronal_shared <- intersect(neuronal_gene_key, rownames(counts))
+stopifnot(length(neuronal_shared) > 18000L)
+neuronal_reference_counts <- neuronal_dge$counts[
+  match(neuronal_shared, neuronal_gene_key), , drop = FALSE
+]
+rownames(neuronal_reference_counts) <- neuronal_shared
+neuronal_bulk_counts <- counts[
+  match(neuronal_shared, rownames(counts)), , drop = FALSE
+]
+rownames(neuronal_bulk_counts) <- neuronal_shared
+neuronal_joint <- edgeR::DGEList(counts = cbind(
+  neuronal_reference_counts, neuronal_bulk_counts
+))
+neuronal_joint <- edgeR::calcNormFactors(neuronal_joint, method = "TMM")
+neuronal_logcpm <- edgeR::cpm(neuronal_joint, log = TRUE, prior.count = 2)
+reference_variance <- apply(neuronal_logcpm[, neuronal_ids, drop = FALSE], 1, var)
+projection_genes <- names(sort(reference_variance, decreasing = TRUE))[
+  seq_len(min(2000L, length(reference_variance)))
+]
+write.csv(data.frame(gene = projection_genes),
+          file.path(outdir, "figure2e_projection_2000_genes.csv"), row.names = FALSE)
+reference_input <- t(neuronal_logcpm[
+  projection_genes, neuronal_ids, drop = FALSE
+])
+reference_center <- colMeans(reference_input)
+reference_pca <- stats::prcomp(reference_input, center = TRUE, scale. = FALSE)
+reference_scores <- reference_pca$x[, 1:7, drop = FALSE]
+bulk_input <- t(neuronal_logcpm[
+  projection_genes, sample_ids, drop = FALSE
+])
+bulk_scores <- sweep(bulk_input, 2, reference_center, "-") %*%
+  reference_pca$rotation[, 1:7, drop = FALSE]
+joint_scores <- rbind(reference_scores, bulk_scores)
+set.seed(197289 + 7L)
+tsne_result <- Rtsne::Rtsne(
+  joint_scores, dims = 2, perplexity = 10, theta = 0,
+  pca = FALSE, check_duplicates = FALSE, max_iter = 2000,
+  verbose = FALSE
+)$Y
+# The t-SNE orientation is arbitrary. Rotate the two coordinates without
+# changing pairwise geometry so the physical square panel does not contain
+# a large vertical padding band solely because the initial orientation was wide.
+tsne_rotation_radians <- 28 * pi / 180
+tsne_rotation <- matrix(c(cos(tsne_rotation_radians), -sin(tsne_rotation_radians),
+                          sin(tsne_rotation_radians),  cos(tsne_rotation_radians)),
+                        nrow = 2)
+tsne_result <- tsne_result %*% tsne_rotation
+rownames(tsne_result) <- rownames(joint_scores)
+reference_coordinates <- data.frame(
+  sample_id = neuronal_ids,
+  refined_identity = neuronal_metadata$refined_neuronal_label,
+  TSNE1 = tsne_result[neuronal_ids, 1],
+  TSNE2 = tsne_result[neuronal_ids, 2]
+)
+bulk_coordinates <- data.frame(
+  design,
+  TSNE1 = tsne_result[sample_ids, 1],
+  TSNE2 = tsne_result[sample_ids, 2]
+)
+stopifnot(nrow(reference_coordinates) == length(neuronal_ids),
+          nrow(bulk_coordinates) == 14L,
+          all(is.finite(tsne_result)))
+write.csv(reference_coordinates,
+          file.path(outdir, "figure2e_reference_tsne_coordinates.csv"), row.names = FALSE)
+write.csv(bulk_coordinates,
+          file.path(outdir, "figure2e_bulk_tsne_coordinates.csv"), row.names = FALSE)
+```
+
+```{r}
+#| label: figure-2e-joint-tsne
+#| fig-width: 3.35
+#| fig-height: 3.2
+tsne_tgn <- bulk_coordinates[bulk_coordinates$sample_id %in% tgn_ids, ]
+tsne_tgn$week_label <- factor(paste0("W", tsne_tgn$week),
+                              levels = paste0("W", 1:4))
+tsne_tgn <- tsne_tgn[
+  order(match(tsne_tgn$lot, lot_order), tsne_tgn$week), ]
+week_centers <- aggregate(
+  cbind(TSNE1, TSNE2) ~ week_label, data = tsne_tgn, FUN = median
+)
+week_centers$label_x <- max(tsne_tgn$TSNE1) + 2
+tsne_hdrg <- bulk_coordinates[
+  bulk_coordinates$sample_id %in% c("hDRG", "TAK2204464A"), ]
+reference_palette <- identity_palette[
+  sort(unique(reference_coordinates$refined_identity))
+]
+stopifnot(!anyNA(reference_palette),
+          setequal(names(reference_palette), identity_ids))
+week_colors <- c(W1 = "#BDBDBD", W2 = "#F4A582",
+                 W3 = "#D6604D", W4 = "#B2182B")
+tsne_distance_sq <- outer(tsne_tgn$TSNE1, reference_coordinates$TSNE1, "-")^2 +
+  outer(tsne_tgn$TSNE2, reference_coordinates$TSNE2, "-")^2
+nearest_reference_ix <- max.col(-tsne_distance_sq, ties.method = "first")
+nearby_identities <- unique(
+  reference_coordinates$refined_identity[nearest_reference_ix]
+)
+nearby_labels <- do.call(rbind, lapply(nearby_identities, function(id) {
+  candidates <- which(reference_coordinates$refined_identity == id)
+  selected <- candidates[which.min(apply(
+    tsne_distance_sq[, candidates, drop = FALSE], 2, min
+  ))]
+  data.frame(
+    sample_id = reference_coordinates$sample_id[selected],
+    refined_identity = id,
+    label = short_identity(id, identity_ids),
+    TSNE1 = reference_coordinates$TSNE1[selected],
+    TSNE2 = reference_coordinates$TSNE2[selected]
+  )
+}))
+write.csv(nearby_labels, file.path(outdir, "figure2e_nearby_reference_label_key.csv"),
+          row.names = FALSE)
+# NF3-SC01 has three separated reference pseudobulks next to the TGN paths.
+# Use one explicit family callout with leaders to all three rather than
+# duplicating its text.
+nearby_labels_auto <- nearby_labels[
+  nearby_labels$refined_identity != "NF3__SC01", , drop = FALSE
+]
+nf3_sc01_targets <- reference_coordinates[
+  reference_coordinates$sample_id %in% c("1__NF3__SC01", "2__NF3__SC01",
+                                         "3__NF3__SC01"),
+  c("sample_id", "TSNE1", "TSNE2"), drop = FALSE
+]
+stopifnot(nrow(nf3_sc01_targets) == 3L)
+nf3_sc01_callout <- data.frame(
+  TSNE1 = -53.5, TSNE2 = -51.3, label = "NF3-SC01"
+)
+joint_tsne <- ggplot() +
+  geom_point(data = reference_coordinates,
+             aes(TSNE1, TSNE2, colour = refined_identity),
+             size = 1.40, alpha = 0.87) +
+  geom_path(data = tsne_tgn,
+            aes(TSNE1, TSNE2, group = lot),
+            colour = "#333333", linewidth = 0.28,
+            arrow = grid::arrow(length = grid::unit(0.08, "cm"))) +
+  geom_point(data = tsne_tgn,
+             aes(TSNE1, TSNE2, fill = week_label),
+             shape = 21, colour = "#333333", stroke = 0.35,
+             size = 2.25) +
+  geom_segment(
+    data = week_centers,
+    aes(x = TSNE1, y = TSNE2, xend = label_x - 1, yend = TSNE2),
+    colour = "#9B9B9B", linewidth = 0.22,
+    show.legend = FALSE
+  ) +
+  geom_text(
+    data = week_centers,
+    aes(x = label_x, y = TSNE2, label = week_label),
+    colour = "#202020", size = 2.35, hjust = 0,
+    show.legend = FALSE
+  ) +
+  ggrepel::geom_label_repel(
+    data = nearby_labels_auto, aes(TSNE1, TSNE2, label = label),
+    colour = "#1A1A1A", fill = "white", size = 2.15,
+    label.size = 0.10, label.padding = grid::unit(0.045, "lines"),
+    box.padding = 0.13, point.padding = 0.04,
+    min.segment.length = 0, max.overlaps = Inf, seed = 197289,
+    show.legend = FALSE
+  ) +
+  geom_segment(
+    data = nf3_sc01_targets,
+    aes(x = TSNE1, y = TSNE2,
+        xend = nf3_sc01_callout$TSNE1,
+        yend = nf3_sc01_callout$TSNE2 + 0.28),
+    colour = "#202020", linewidth = 0.30, show.legend = FALSE
+  ) +
+  geom_label(
+    data = nf3_sc01_callout, aes(TSNE1, TSNE2, label = label),
+    colour = "#1A1A1A", fill = "white", size = 2.15,
+    label.size = 0.10, label.padding = grid::unit(0.045, "lines"),
+    show.legend = FALSE
+  ) +
+  geom_point(data = tsne_hdrg, aes(TSNE1, TSNE2),
+             shape = 23, fill = "white", colour = "black", size = 2.25) +
+  ggrepel::geom_text_repel(data = tsne_hdrg,
+                           aes(TSNE1, TSNE2, label = biological_label),
+                           size = 2.25, seed = 197296, max.overlaps = Inf,
+                           show.legend = FALSE) +
+  scale_colour_manual(values = reference_palette, guide = "none") +
+  scale_fill_manual(values = week_colors, guide = "none") +
+  coord_equal() + labs(x = "t-SNE 1", y = "t-SNE 2") +
+  theme_minimal(base_size = 8.5, base_family = "sans") +
+  theme(panel.grid.major = element_line(colour = "#E4E4E4", linewidth = 0.22),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(colour = "#C8C8C8", linewidth = 0.24),
+        legend.position = "none",
+        axis.title = element_text(size = 8.2),
+        axis.text = element_text(size = 7.0, colour = "#686868"),
+        plot.background = element_rect(fill = "white", colour = NA),
+        panel.background = element_rect(fill = "white", colour = NA),
+        plot.margin = margin(2, 2, 2, 2))
+joint_tsne
+ggsave(file.path(outdir, "figure2e_joint_tsne.pdf"), joint_tsne,
+       width = 3.35, height = 3.2, units = "in", device = cairo_pdf)
+grDevices::svg(file.path(outdir, "figure2e_joint_tsne.svg"),
+               width = 3.35, height = 3.2)
+print(joint_tsne)
+grDevices::dev.off()
+ggsave(file.path(outdir, "figure2e_joint_tsne.png"), joint_tsne,
+       width = 3.35, height = 3.2, units = "in", dpi = 600, type = "cairo-png")
+```
+
+## Figure 2 shared reference key
+
+This detachable key applies to the Figure 2D UMAP and Figure 2E joint t-SNE. Identity colors and short labels are identical in both panels. Culture weeks and hDRG controls are directly labeled in the t-SNE, rather than repeated in this reference key.
+
+```{r}
+#| label: figure-2-shared-key
+#| fig-width: 6.8
+#| fig-height: 1.65
+identity_subtitles <- c(
+  "cLTMR__SC01" = "C-LTMR-like (CASQ2/P2RY1)",
+  "NF1__SC01" = "Neurofilament+ A-LTMR; Aβ NTRK1+/SCN10A+",
+  "NF1__SC02" = "Neurofilament+ A-LTMR; Aβ NTRK1+/SCN10A+",
+  "NF1__SC03" = "Neurofilament+ A-LTMR; Aβ NTRK1+/SCN10A+",
+  "NF2__SC01" = "Neurofilament+ A-LTMR; Aβ NTRK3+",
+  "NF2__SC02" = "Neurofilament+ A-LTMR; Aβ NTRK3+",
+  "NF2__SC03" = "Aβ-LTMR-like (NTRK3/PVALB)",
+  "NF3__SC01" = "Neurofilament+ LTMR; Aδ-enriched (Yang)",
+  "NF3__SC02" = "Aδ-LTMR-like (NTRK2/PIEZO2)",
+  "NF3__SC03" = "Neurofilament+ LTMR; Aδ-enriched (Yang)",
+  "NP__SC01" = "Non-peptidergic nociceptor-associated",
+  "PEP__SC01" = "Peptidergic nociceptor-associated",
+  "PEP__SC02" = "Peptidergic nociceptor-associated",
+  "PEP__SC03" = "Peptidergic nociceptor-associated",
+  "PEP__SC04" = "Peptidergic nociceptor-associated",
+  "SST__SC01" = "SST / cold-pruriceptor-associated",
+  "SST__SC02" = "SST / cold-pruriceptor-associated",
+  "TRPM8__SC01" = "TRPM8 / cold-pruriceptor-associated"
+)
+stopifnot(setequal(names(identity_subtitles), identity_ids),
+          !anyDuplicated(names(identity_subtitles)))
+reference_label_dictionary <- data.frame(
+  source_identity = identity_ids,
+  plot_label = short_identity(identity_ids, identity_ids),
+  color = unname(identity_palette[identity_ids]),
+  manuscript_supported_subtitle = unname(identity_subtitles[identity_ids]),
+  subcluster_boundary = "Donor-supported within-class reference subcluster; not a literal culture cell type",
+  row.names = NULL
+)
+write.csv(reference_label_dictionary,
+          file.path(outdir, "figure2_reference_label_dictionary.csv"),
+          row.names = FALSE)
+# A compact, reproducible family-level comparison for a Figure S2A callout.
+# It supports visual contrast only; it does not redefine the author taxonomy.
+nf1_ref_ids <- reference_metadata$pseudobulk_id[reference_metadata$subtype_author == "NF1"]
+nf2_ref_ids <- reference_metadata$pseudobulk_id[reference_metadata$subtype_author == "NF2"]
+nf1_nf2_marker_contrast <- data.frame(
+  gene = rownames(reference_expression),
+  mean_log2_cpm_nf1 = rowMeans(reference_expression[, nf1_ref_ids, drop = FALSE]),
+  mean_log2_cpm_nf2 = rowMeans(reference_expression[, nf2_ref_ids, drop = FALSE])
+)
+nf1_nf2_marker_contrast$nf2_minus_nf1 <-
+  nf1_nf2_marker_contrast$mean_log2_cpm_nf2 - nf1_nf2_marker_contrast$mean_log2_cpm_nf1
+nf1_nf2_marker_contrast <- nf1_nf2_marker_contrast[
+  match(c("NTRK1", "SCN10A", "NTRK3", "S100B"), nf1_nf2_marker_contrast$gene), ]
+stopifnot(!anyNA(nf1_nf2_marker_contrast$gene))
+write.csv(nf1_nf2_marker_contrast,
+          file.path(outdir, "figure2_nf1_nf2_marker_contrast.csv"),
+          row.names = FALSE)
+shared_key <- data.frame(identity = identity_ids,
+                         label = short_identity(identity_ids, identity_ids),
+                         x = rep(seq_len(6), length.out = length(identity_ids)),
+                         y = 4 - rep(seq_len(3), each = 6, length.out = length(identity_ids)))
+shared_key_plot <- ggplot() +
+  geom_point(data = shared_key, aes(x, y, colour = identity), size = 2.2) +
+  geom_text(data = shared_key, aes(x + 0.10, y, label = label),
+            hjust = 0, size = 2.6, colour = "#202020") +
+  scale_colour_manual(values = identity_palette, guide = "none") +
+  scale_fill_manual(values = week_colors, guide = "none") +
+  coord_cartesian(xlim = c(0.8, 6.95), ylim = c(1.7, 3.3), clip = "off") +
+  theme_void(base_size = 8.5, base_family = "sans") +
+  theme(legend.position = "none", plot.margin = margin(2, 2, 2, 2),
+        plot.background = element_rect(fill = "white", colour = NA))
+shared_key_plot
+ggsave(file.path(outdir, "figure2_shared_reference_key.pdf"), shared_key_plot,
+       width = 6.8, height = 1.65, units = "in", device = cairo_pdf)
+grDevices::svg(file.path(outdir, "figure2_shared_reference_key.svg"),
+               width = 6.8, height = 1.65)
+print(shared_key_plot)
+grDevices::dev.off()
+ggsave(file.path(outdir, "figure2_shared_reference_key.png"), shared_key_plot,
+       width = 6.8, height = 1.65, units = "in", dpi = 600, type = "cairo-png")
+
+# Complete key for author-controlled page assembly.  It deliberately includes
+# every UMAP/t-SNE label and gives the strongest manuscript-supported descriptor
+# for that reference state; it does not assign an unvalidated terminal fate to
+# the remaining within-family SC labels.
+guide_family_order <- c("NF1", "NF2", "NF3", "PEP",
+                        "cLTMR", "NP", "SST", "TRPM8")
+guide_boxes <- data.frame(
+  family = guide_family_order,
+  x = rep(1:4, times = 2),
+  top_row = rep(c(TRUE, FALSE), each = 4),
+  subtitle = c(
+    "Neurofilament+ A-LTMR\nAβ NTRK1+/SCN10A+",
+    "Neurofilament+ A-LTMR\nAβ NTRK3+",
+    "Neurofilament+ LTMR\nAδ-enriched",
+    "Peptidergic nociceptor-\nassociated",
+    "C-LTMR-like\n(CASQ2/P2RY1)",
+    "Non-peptidergic nociceptor-\nassociated",
+    "SST / cold-pruriceptor-\nassociated",
+    "TRPM8 / cold-pruriceptor-\nassociated"
+  )
+)
+guide_boxes$ymin <- ifelse(guide_boxes$top_row, 4.25, 0.35)
+guide_boxes$ymax <- ifelse(guide_boxes$top_row, 9.00, 3.90)
+guide_boxes$fill <- unname(grDevices::adjustcolor(
+  family_colors[guide_boxes$family], alpha.f = 0.10
+))
+guide_items <- do.call(rbind, lapply(seq_len(nrow(guide_boxes)), function(i) {
+  family <- guide_boxes$family[i]
+  ids <- identity_ids[startsWith(identity_ids, paste0(family, "__"))]
+  y <- if (guide_boxes$top_row[i]) {
+    if (length(ids) == 3L) seq(6.85, 4.85, length.out = 3L) else
+      seq(6.75, 5.15, length.out = length(ids))
+  } else {
+    seq(2.15, 1.25, length.out = length(ids))
+  }
+  data.frame(
+    family = family, x = guide_boxes$x[i], y = y,
+    identity = ids, label = short_identity(ids, identity_ids),
+    color = unname(identity_palette[ids])
+  )
+}))
+guide_items$label[guide_items$identity == "NF2__SC03"] <- "NF2-SC03\nAβ-LTMR-like\n(NTRK3/PVALB)"
+guide_items$label[guide_items$identity == "NF3__SC02"] <- "NF3-SC02\nAδ-LTMR-like\n(NTRK2/PIEZO2)"
+reference_identity_guide_plot <- ggplot() +
+  geom_rect(data = guide_boxes,
+            aes(xmin = x - 0.46, xmax = x + 0.46, ymin = ymin, ymax = ymax,
+                fill = fill), colour = "#D0D0D0", linewidth = 0.22,
+            show.legend = FALSE) +
+  geom_text(data = guide_boxes,
+            aes(x, ymax - 0.40, label = family), fontface = "bold",
+            size = 4.40, colour = "#303030") +
+  geom_text(data = guide_boxes,
+            aes(x, ymax - 1.15, label = subtitle), size = 2.70,
+            lineheight = 0.92, colour = "#505050") +
+  geom_point(data = guide_items, aes(x - 0.31, y, colour = color), size = 2.55) +
+  geom_text(data = guide_items, aes(x - 0.21, y, label = label), hjust = 0,
+            size = 2.75, lineheight = 0.92, colour = "#202020") +
+  scale_colour_identity() + scale_fill_identity() +
+  coord_cartesian(xlim = c(0.48, 4.52), ylim = c(0.10, 9.18), clip = "off") +
+  theme_void(base_size = 10, base_family = "sans") +
+  theme(plot.margin = margin(4, 4, 4, 4),
+        plot.background = element_rect(fill = "white", colour = NA))
+ggsave(file.path(outdir, "figure2_reference_identity_guide.pdf"),
+       reference_identity_guide_plot, width = 8.84, height = 3.40,
+       units = "in", device = cairo_pdf)
+grDevices::svg(file.path(outdir, "figure2_reference_identity_guide.svg"),
+               width = 8.84, height = 3.40)
+print(reference_identity_guide_plot)
+grDevices::dev.off()
+ggsave(file.path(outdir, "figure2_reference_identity_guide.png"),
+       reference_identity_guide_plot, width = 8.84, height = 3.40,
+       units = "in", dpi = 600, type = "cairo-png")
+
+key_families <- c(NF1 = "NF1", NF2 = "NF2", NF3 = "NF3", PEP = "PEP")
+shared_key_compact <- do.call(rbind, lapply(seq_along(key_families), function(i) {
+  family <- names(key_families)[i]
+  ids <- identity_ids[startsWith(identity_ids, paste0(family, "__"))]
+  data.frame(family = family, x = i,
+             label = short_identity(ids, identity_ids),
+             color = unname(identity_palette[ids]),
+             y = seq(3.75, 1.25, length.out = length(ids)))
+}))
+key_family_boxes <- data.frame(
+  family = names(key_families), x = seq_along(key_families),
+  fill = unname(grDevices::adjustcolor(family_colors[names(key_families)], alpha.f = 0.12))
+)
+shared_key_compact_plot <- ggplot() +
+  geom_rect(data = key_family_boxes,
+            aes(xmin = x - 0.45, xmax = x + 0.45, ymin = 0.75, ymax = 4.85,
+                fill = fill), colour = "#D0D0D0", linewidth = 0.22, show.legend = FALSE) +
+  geom_text(data = key_family_boxes, aes(x, 4.45, label = family),
+            fontface = "bold", size = 2.1, colour = "#333333") +
+  geom_point(data = shared_key_compact, aes(x - 0.29, y, colour = color), size = 1.65) +
+  geom_text(data = shared_key_compact, aes(x - 0.20, y, label = label), hjust = 0,
+            size = 1.92, colour = "#202020") +
+  scale_colour_identity() + scale_fill_identity() +
+  coord_cartesian(xlim = c(0.48, 4.52), ylim = c(0.55, 5.05), clip = "off") +
+  theme_void(base_size = 7, base_family = "sans") +
+  theme(plot.margin = margin(1, 1, 1, 1),
+        plot.background = element_rect(fill = "white", colour = NA))
+ggsave(file.path(outdir, "figure2_shared_reference_key_compact.pdf"),
+       shared_key_compact_plot, width = 3.35, height = 1.55,
+       units = "in", device = cairo_pdf)
+grDevices::svg(file.path(outdir, "figure2_shared_reference_key_compact.svg"),
+               width = 3.35, height = 1.55)
+print(shared_key_compact_plot)
+grDevices::dev.off()
+ggsave(file.path(outdir, "figure2_shared_reference_key_compact.png"),
+       shared_key_compact_plot, width = 3.35, height = 1.55,
+       units = "in", dpi = 600, type = "cairo-png")
+```
+
+## Supplement S2D: corrected matched-lot expression trajectories
+
+The seven programs use the frozen original marker groups. Within a program of `n` eligible genes, each gene's weight is the sum of its Spearman correlations with the other program genes across the combined reference pseudobulks, divided by `n` and floored at 0.05. Corrected bulk log2 CPM is standardized gene by gene using the combined-reference mean and sample SD; the program score is the weighted mean of those z-scores. The three signed reference axes (Aβ-LTMR-like, C-LTMR-like, Aδ-LTMR-like) instead use the frozen identity-specific positive and anti-marker weights and **neuronal** pseudobulk centers/scales. Each axis is the positive-marker weighted mean z-score minus the anti-marker weighted mean z-score. A zero or undefined reference SD is replaced by one. All ten scores and their gene counts are retained in exported tables. S2D displays all seven gene-set scores, including negative off-target glial scores, with independent y-scales; lines are descriptive matched-lot trajectories, not longitudinal hypothesis tests. The signed marker contrasts remain in the exported table but are not plotted in S2D.
+
+```{r}
+#| label: trajectories-calculate
+reference_only_logcpm_path <- file.path(
+  repo_root, "results", "pseudobulk",
+  "GSE197289_TG_combined_reference_logCPM.csv"
+)
+stopifnot(file.exists(reference_only_logcpm_path))
+reference_only_logcpm <- as.matrix(read.csv(
+  reference_only_logcpm_path, row.names = 1, check.names = FALSE
+))
+neuronal_ref_ids <- combined_metadata$pseudobulk_id[
+  combined_metadata$reference_level == "Neuronal subtype"
+]
+stopifnot(all(neuronal_ref_ids %in% colnames(joint_logcpm)))
+
+score_genes <- function(genes_here, weights, reference_ids_here) {
+  stopifnot(length(genes_here) > 0L, length(genes_here) == length(weights),
+            all(genes_here %in% rownames(joint_logcpm)),
+            length(reference_ids_here) > 1L,
+            all(reference_ids_here %in% colnames(joint_logcpm)),
+            all(is.finite(weights)), sum(weights) > 0)
+  ref <- joint_logcpm[genes_here, reference_ids_here, drop = FALSE]
+  center <- rowMeans(ref)
+  gene_sd <- apply(ref, 1, sd)
+  gene_sd[!is.finite(gene_sd) | gene_sd == 0] <- 1
+  bulk <- joint_logcpm[genes_here, sample_ids, drop = FALSE]
+  z <- sweep(sweep(bulk, 1, center, "-"), 1, gene_sd, "/")
+  colSums(sweep(z, 1, weights, "*")) / sum(weights)
+}
+
+program_names <- c("Pan-neuronal", "Neurofilament / mechanosensory",
+                   "Peptidergic nociceptor", "Non-peptidergic nociceptor",
+                   "Cold / pruriceptor-associated", "Satellite glia",
+                   "Schwann cell")
+program_gene_counts <- setNames(vapply(program_names, function(program) {
+  length(unique(original_manifest$gene[
+    original_manifest$marker_group == program &
+      original_manifest$gene %in% rownames(joint_logcpm) &
+      original_manifest$gene %in% rownames(reference_only_logcpm)
+  ]))
+}, integer(1)), program_names)
+stopifnot(all(program_gene_counts >= 3L))
+program_scores <- do.call(rbind, lapply(program_names, function(program) {
+  program_genes <- unique(original_manifest$gene[
+    original_manifest$marker_group == program &
+      original_manifest$gene %in% rownames(joint_logcpm) &
+      original_manifest$gene %in% rownames(reference_only_logcpm)
+  ])
+  stopifnot(length(program_genes) >= 3L)
+  gene_cor <- cor(t(reference_only_logcpm[
+    program_genes, , drop = FALSE
+  ]), method = "spearman")
+  mean_cor <- rowMeans(gene_cor) - 1 / nrow(gene_cor)
+  weights <- pmax(mean_cor, 0.05)
+  data.frame(sample_id = sample_ids, axis = program,
+             score = unname(score_genes(program_genes, weights,
+                                        reference_sample_ids)))
+}))
+
+signed_axis_groups <- c("A-beta LTMR signed axis" = "NF2__SC03",
+                        "C-LTMR signed axis" = "cLTMR__SC01",
+                        "A-delta LTMR signed axis" = "NF3__SC02")
+signed_axis_gene_counts <- do.call(rbind, lapply(names(signed_axis_groups), function(axis_name) {
+  panel <- marker_manifest[
+    marker_manifest$marker_group == signed_axis_groups[[axis_name]] &
+      marker_manifest$direction %in% c("positive", "negative") &
+      marker_manifest$gene %in% rownames(joint_logcpm), , drop = FALSE
+  ]
+  data.frame(axis = axis_name,
+             positive_genes = length(unique(panel$gene[panel$direction == "positive"])),
+             anti_genes = length(unique(panel$gene[panel$direction == "negative"])))
+}))
+write.csv(rbind(
+  data.frame(axis = names(program_gene_counts),
+             score_type = "gene-set program", genes = unname(program_gene_counts),
+             positive_genes = NA_integer_, anti_genes = NA_integer_),
+  data.frame(axis = signed_axis_gene_counts$axis,
+             score_type = "signed marker contrast",
+             genes = signed_axis_gene_counts$positive_genes + signed_axis_gene_counts$anti_genes,
+             positive_genes = signed_axis_gene_counts$positive_genes,
+             anti_genes = signed_axis_gene_counts$anti_genes)
+), file.path(outdir, "s2d_score_gene_counts.csv"), row.names = FALSE)
+signed_axis_scores <- do.call(rbind, lapply(names(signed_axis_groups), function(axis_name) {
+  signed_panel <- marker_manifest[
+    marker_manifest$marker_group == signed_axis_groups[[axis_name]] &
+      marker_manifest$direction %in% c("positive", "negative") &
+      marker_manifest$gene %in% rownames(joint_logcpm), , drop = FALSE
+  ]
+  positive <- signed_panel[signed_panel$direction == "positive", , drop = FALSE]
+  negative <- signed_panel[signed_panel$direction == "negative", , drop = FALSE]
+  stopifnot(nrow(positive) > 0L, nrow(negative) > 0L,
+            !anyDuplicated(positive$gene), !anyDuplicated(negative$gene))
+  signed_scores <- score_genes(positive$gene, positive$marker_weight,
+                               neuronal_ref_ids) -
+    score_genes(negative$gene, negative$marker_weight,
+                neuronal_ref_ids)
+  data.frame(sample_id = sample_ids, axis = axis_name,
+             score = unname(signed_scores))
+}))
+trajectory_values <- rbind(program_scores, signed_axis_scores)
+trajectory_values <- trajectory_values[
+  trajectory_values$sample_id %in% tgn_ids, , drop = FALSE
+]
+trajectory_values$specimen_id <- design$lot[
+  match(trajectory_values$sample_id, design$sample_id)
+]
+trajectory_values$week <- design$week[
+  match(trajectory_values$sample_id, design$sample_id)
+]
+stopifnot(nrow(trajectory_values) == 120L,
+          all(is.finite(trajectory_values$score)),
+          setequal(unique(trajectory_values$axis),
+                   c(program_names, names(signed_axis_groups))),
+          all(table(trajectory_values$axis, trajectory_values$specimen_id) == 4L))
+write.csv(trajectory_values,
+          file.path(outdir, "s2d_corrected_trajectory_values.csv"),
+          row.names = FALSE)
+```
+
+```{r}
+#| label: s2d-trajectories
+#| fig-width: 4.7
+#| fig-height: 3.0
+trajectory_values$axis <- factor(
+  trajectory_values$axis,
+  levels = c(program_names, names(signed_axis_groups))
+)
+lot_colors <- c(TGN1003A = "#1B9E77", TGN1028B = "#D95F02",
+                TGN1215AvX = "#7570B3")
+program_trajectory <- droplevels(trajectory_values[
+  trajectory_values$axis %in% program_names, , drop = FALSE])
+program_labels <- setNames(
+  paste0(c("Neuronal", "Mechano.", "Peptidergic", "Non-peptid.",
+           "Cold/prur.", "Satellite glia", "Schwann"),
+         " (n=", unname(program_gene_counts), ")"),
+  names(program_gene_counts)
+)
+trajectory_plot <- ggplot(
+  program_trajectory,
+  aes(week, score, group = specimen_id, colour = specimen_id)
+) +
+  geom_hline(yintercept = 0, colour = "#B8B8B8", linewidth = 0.35) +
+  geom_line(linewidth = 0.5) + geom_point(size = 0.85) +
+  facet_wrap(~ axis, ncol = 4, scales = "free_y",
+             labeller = as_labeller(program_labels)) +
+  scale_x_continuous(breaks = 1:4) +
+  scale_colour_manual(values = lot_colors, name = "Lot") +
+  labs(x = "Week", y = "Score (reference z)") +
+  theme_minimal(base_size = 8.5, base_family = "sans") +
+  theme(panel.grid = element_blank(), legend.position = "bottom",
+        plot.background = element_rect(fill = "white", colour = NA),
+        panel.background = element_rect(fill = "white", colour = NA),
+        strip.text = element_text(size = 6.0),
+        axis.text = element_text(size = 5.6),
+        axis.title = element_text(size = 6.6),
+        legend.text = element_text(size = 6.0),
+        legend.title = element_text(size = 6.0),
+        panel.spacing = grid::unit(0.10, "cm"))
+trajectory_plot
+ggsave(file.path(outdir, "s2d_expression_trajectories.pdf"),
+       trajectory_plot, width = 4.7, height = 3.0,
+       units = "in", device = cairo_pdf)
+grDevices::svg(file.path(outdir, "s2d_expression_trajectories.svg"),
+               width = 4.7, height = 3.0)
+print(trajectory_plot)
+grDevices::dev.off()
+ggsave(file.path(outdir, "s2d_expression_trajectories.png"),
+       trajectory_plot, width = 4.7, height = 3.0,
+       units = "in", dpi = 600, type = "cairo-png")
+```
+
+
+## Supplement S2E: literature list versus donor-refined fit
+
+This comparison uses the same corrected joint-normalized data, reference identities, and NNLS fitting rule for both models; only the eligible gene set differs (original literature list, 79 genes; donor-refined list, 788 genes). Each bar uses one common 0–100% scale. The VIF panel, rather than fitted-weight shifts, is the evidence for improved numerical conditioning. These normalized coefficients are relative similarities within a fitted reference space, not cell fractions.
+
+```{r}
+#| label: s2e-signature-comparison
+#| fig-width: 4.7
+#| fig-height: 2.2
+fit_original_signature <- function(sample_id) {
+  target <- 2^joint_logcpm[original_genes, sample_id]
+  fit <- nnls::nnls(original_signature, as.numeric(target))
+  coefficient <- pmax(fit$x, 0)
+  stopifnot(sum(coefficient) > 0)
+  coefficient / sum(coefficient)
+}
+original_coefficients <- sapply(tgn_ids, fit_original_signature)
+rownames(original_coefficients) <- identity_order
+stopifnot(all(abs(colSums(original_coefficients) - 1) < 1e-8),
+          all(original_coefficients >= 0))
+original_long <- data.frame(
+  sample_id = rep(colnames(original_coefficients),
+                  each = nrow(original_coefficients)),
+  reference_identity = rep(rownames(original_coefficients),
+                           times = ncol(original_coefficients)),
+  coefficient = as.vector(original_coefficients)
+)
+original_long$category <- category_of(original_long$reference_identity)
+original_values <- aggregate(coefficient ~ sample_id + category,
+                             original_long, sum)
+names(original_values)[3] <- "contribution"
+original_values$method <- "Literature list · 79 genes"
+refined_values <- category_values[
+  category_values$sample_id %in% tgn_ids,
+  c("sample_id", "category", "contribution"), drop = FALSE
+]
+refined_values$method <- "Donor-refined · 788 genes"
+comparison_values <- rbind(original_values, refined_values)
+comparison_values$lot <- design$lot[
+  match(comparison_values$sample_id, design$sample_id)
+]
+comparison_values$week <- design$week[
+  match(comparison_values$sample_id, design$sample_id)
+]
+stopifnot(nrow(comparison_values) == 120L,
+          all(table(comparison_values$category,
+                    comparison_values$method) == 12L),
+          all(is.finite(comparison_values$contribution)))
+write.csv(comparison_values,
+          file.path(outdir, "s2e_original_vs_refined_weights_values.csv"),
+          row.names = FALSE)
+comparison_values$group <- ifelse(
+  comparison_values$category %in% c("A-beta-LTMR-like", "C-LTMR-like"),
+  as.character(comparison_values$category), "Other fitted")
+plot_comparison_values <- aggregate(
+  contribution ~ lot + week + method + group, comparison_values, sum)
+stopifnot(nrow(plot_comparison_values) == 72L,
+          all(abs(aggregate(contribution ~ lot + week + method,
+                            plot_comparison_values, sum)$contribution - 1) < 1e-6))
+plot_comparison_values$method <- factor(
+  plot_comparison_values$method,
+  levels = c("Literature list · 79 genes", "Donor-refined · 788 genes"),
+  labels = c("Original", "Refined"))
+plot_comparison_values$lot <- factor(plot_comparison_values$lot, levels = lot_order)
+plot_comparison_values$group <- factor(plot_comparison_values$group,
+  levels = c("A-beta-LTMR-like", "C-LTMR-like", "Other fitted"))
+comparison_plot <- signature_bar_plot(plot_comparison_values, method ~ lot)
+comparison_plot
+ggsave(file.path(outdir, "s2e_original_vs_refined_weights.pdf"),
+       comparison_plot, width = 4.7, height = 2.2,
+       units = "in", device = cairo_pdf)
+grDevices::svg(file.path(outdir, "s2e_original_vs_refined_weights.svg"),
+               width = 4.7, height = 2.2)
+print(comparison_plot)
+grDevices::dev.off()
+ggsave(file.path(outdir, "s2e_original_vs_refined_weights.png"),
+       comparison_plot, width = 4.7, height = 2.2,
+       units = "in", dpi = 600, type = "cairo-png")
+```
+
+## Supplement S2C–E: lower-half page layout
+
+The three panels occupy an 8.15 × 5.2 inch area within the lower half of an 8.5 × 11 inch portrait page. S2C retains its per-identity bars at left; S2D and S2E stack at right. Individual exports remain available for editable assembly.
+
+```{r}
+#| label: s2-lower-half-layout
+#| fig-width: 8.15
+#| fig-height: 5.2
+lower_half <- vif_plot | (trajectory_plot / comparison_plot +
+  plot_layout(heights = c(3.0, 2.2)))
+lower_half <- lower_half + plot_layout(widths = c(3.25, 4.7))
+lower_half
+ggsave(file.path(outdir, "s2cde_lower_half_layout.pdf"), lower_half,
+       width = 8.15, height = 5.2, units = "in", device = cairo_pdf)
+grDevices::svg(file.path(outdir, "s2cde_lower_half_layout.svg"),
+               width = 8.15, height = 5.2)
+print(lower_half)
+grDevices::dev.off()
+ggsave(file.path(outdir, "s2cde_lower_half_layout.png"), lower_half,
+       width = 8.15, height = 5.2, units = "in", dpi = 600, type = "cairo-png")
+```
+
+## Cross-checks and interpretation boundary
+
+The prior paired-control heatmap's `hDRG reference 2` display is consistent with the author's mapping confirmation, although its source ID remains `TAK2204464A`. Keep that alias visible in the sample key and Methods/provenance record. The final layout and legend still require author approval; a new input or changed mapping should lead to a new run ID, not an overwrite of older images.
+
+```{r}
+#| label: review-checks
+stopifnot(
+  identical(unique(design$biological_label[design$sample_id == "hDRG"]), "hDRG 1"),
+  identical(unique(design$biological_label[design$sample_id == "TAK2204464A"]), "hDRG 2"),
+  setequal(unique(values$sample_id[values$class == "hDRG reference"]),
+           c("hDRG", "TAK2204464A")),
+  all(c("hDRG", "TAK2204464A") %in% normalization$sample_id),
+  !any(grepl("hDRG_[12]$", normalization$sample_id)),
+  all(is.finite(normalization$effective_library_size))
+)
+
+prior_heatmap_path <- file.path(
+  repo_root, "publication_notebook", "inputs", "figure2_bulk_heatmap_values.csv"
+)
+stopifnot(file.exists(prior_heatmap_path))
+prior_heatmap <- read.csv(prior_heatmap_path, stringsAsFactors = FALSE)
+reproduction_check <- merge(
+  values[, c("gene", "sample_id", "log2_cpm")],
+  prior_heatmap[, c("gene", "sample_id", "tmm_log_cpm")],
+  by = c("gene", "sample_id")
+)
+stopifnot(nrow(reproduction_check) == 322L,
+          max(abs(reproduction_check$log2_cpm -
+                    reproduction_check$tmm_log_cpm)) < 1e-10)
+cat("Figure 2C reproduction: 322/322 values match the paired-control export; max absolute difference = ",
+    max(abs(reproduction_check$log2_cpm - reproduction_check$tmm_log_cpm)), "\n", sep = "")
+
+status <- data.frame(
+  component = c("Figure 2C", "Figure 2D reference UMAP",
+                "Figure 2E joint t-SNE", "Figure 2F refined 788-gene signatures",
+                "Figure 2 shared key", "Figure 2 compact key", "Supplemental Figure 1A marker UMAP",
+                "Supplemental Figure 1B reference expression", "Supplemental Figure 1C conditioning",
+                "Supplemental Figure 1D trajectories",
+                "Supplemental Figure 1E original versus refined weights",
+                "Supplemental Figure 1F marker expression"),
+  source_status = c("Recomputed here from corrected controls",
+                    "Generated here from reference-only source",
+                    "Refit seven-PC joint t-SNE in corrected space",
+                    "Refit 788-gene NNLS in corrected joint space",
+                    "Generated from shared UMAP/t-SNE labels and colors",
+                    "Generated from shared UMAP/t-SNE labels and colors",
+                    "Generated from reference SCT normalized expression",
+                    "Generated here from reference-only source",
+                    "Recomputed 79- versus 788-gene joint-space VIF",
+                    "Recomputed reference-standardized corrected-bulk scores",
+                    "Refit original and refined NNLS on the same 12 corrected bulk samples",
+                    "Summarized SCT marker expression across donor-supported refined clusters"),
+  submission_gate = c("Author label/layout approval", "Source checksum and label review",
+                      "Visual/legend review", "Interpretation and legend review",
+                      "Trim and position with main panels", "Slide-placement review",
+                      "Marker and scale legend review",
+                      "Source checksum and legend review", "Interpretation and legend review",
+                      "Reconcile changed score scale with Results/legend",
+                      "Interpretation and legend review",
+                      "Author and reviewer interpretation review")
+)
+knitr::kable(status)
+
+legacy_signature_path <- file.path(
+  repo_root, "publication_notebook", "inputs",
+  "legacy_relative_signature_contributions.csv"
+)
+legacy_trajectory_path <- file.path(
+  repo_root, "publication_notebook", "inputs",
+  "legacy_program_trajectories.csv"
+)
+stopifnot(file.exists(legacy_signature_path), file.exists(legacy_trajectory_path))
+legacy_signature <- read.csv(legacy_signature_path)
+new_signature <- category_values[category_values$sample_id %in% tgn_ids, ]
+signature_comparison <- merge(
+  new_signature, legacy_signature,
+  by.x = c("specimen_id", "week", "category"),
+  by.y = c("specimen_id", "maturation_week", "identity"),
+  suffixes = c("_corrected", "_legacy")
+)
+signature_comparison$delta <- signature_comparison$contribution_corrected -
+  signature_comparison$contribution_legacy
+stopifnot(nrow(signature_comparison) == 60L)
+write.csv(signature_comparison,
+          file.path(outdir, "figure2f_comparison_with_legacy.csv"), row.names = FALSE)
+
+legacy_trajectory <- read.csv(legacy_trajectory_path)
+legacy_trajectory$axis <- ifelse(
+  grepl("^Reference axis: A-beta", legacy_trajectory$axis),
+  "A-beta LTMR signed axis",
+  ifelse(grepl("^Reference axis: C-LTMR", legacy_trajectory$axis),
+         "C-LTMR signed axis",
+         ifelse(grepl("^Reference axis: A-delta", legacy_trajectory$axis),
+                "A-delta LTMR signed axis",
+                sub("^Program: ", "", legacy_trajectory$axis)))
+)
+new_trajectory <- trajectory_values
+new_trajectory$axis <- as.character(new_trajectory$axis)
+trajectory_comparison <- merge(
+  new_trajectory, legacy_trajectory,
+  by.x = c("specimen_id", "week", "axis"),
+  by.y = c("specimen_id", "maturation_week", "axis"),
+  suffixes = c("_corrected", "_legacy")
+)
+trajectory_comparison$delta <- trajectory_comparison$score_corrected -
+  trajectory_comparison$score_legacy
+stopifnot(nrow(trajectory_comparison) == 120L)
+write.csv(trajectory_comparison,
+          file.path(outdir, "s2d_comparison_with_legacy.csv"), row.names = FALSE)
+cat("Largest absolute category contribution change vs. legacy:",
+    max(abs(signature_comparison$delta)), "\n")
+cat("Largest absolute trajectory-score change vs. legacy:",
+    max(abs(trajectory_comparison$delta)), "\n")
+
+reference_inputs <- data.frame(
+  role = c("reference UMAP object", "reference expression", "reference metadata",
+           "frozen Ensembl-symbol map", "combined reference DGE",
+           "combined reference metadata", "signed refined marker manifest",
+           "original marker manifest", "neuronal reference DGE",
+           "neuronal reference metadata", "reference-only expression for weights",
+           "legacy signature comparison", "legacy trajectory comparison"),
+  source = vapply(c(reference_object_path, reference_expression_path,
+                    reference_metadata_path, id_map_path, reference_dge_path,
+                    combined_metadata_path, marker_manifest_path,
+                    original_manifest_path, neuronal_dge_path,
+                    neuronal_metadata_path, reference_only_logcpm_path,
+                    legacy_signature_path, legacy_trajectory_path),
+                  function(path) substring(path, nchar(repo_root) + 2L), character(1)),
+  sha256 = vapply(c(reference_object_path, reference_expression_path,
+                    reference_metadata_path, id_map_path, reference_dge_path,
+                    combined_metadata_path, marker_manifest_path,
+                    original_manifest_path, neuronal_dge_path,
+                    neuronal_metadata_path, reference_only_logcpm_path,
+                    legacy_signature_path, legacy_trajectory_path),
+                  file_sha256, character(1))
+)
+input_manifest <- rbind(input_manifest, reference_inputs)
+write.csv(input_manifest, file.path(outdir, "input_manifest.csv"), row.names = FALSE)
+
+panel_manifest <- data.frame(
+  panel = status$component,
+  generation_state = rep("generated; author review required", 12),
+  output_stem = c("figure2c_heatmap", "figure2d_reference_umap",
+                  "figure2e_joint_tsne", "figure2f_refined_788_signature",
+                  "figure2_shared_reference_key", "figure2_shared_reference_key_compact",
+                  "s2a_marker_umap_grid",
+                  "s2b_reference_expression", "s2c_signature_conditioning",
+                  "s2d_expression_trajectories", "s2e_original_vs_refined_weights",
+                  "s1f_refined_marker_expression"),
+  method = status$source_status,
+  publication_gate = status$submission_gate
+)
+write.csv(panel_manifest, file.path(outdir, "panel_manifest.csv"), row.names = FALSE)
+knitr::kable(panel_manifest)
+
+generated_files <- unlist(lapply(panel_manifest$output_stem[
+  grepl("^generated", panel_manifest$generation_state)], function(stem) {
+    file.path(outdir, paste0(stem, c(".pdf", ".svg", ".png")))
+  }))
+stopifnot(all(file.exists(generated_files)))
+panel_files <- data.frame(
+  file = basename(generated_files),
+  sha256 = vapply(generated_files, file_sha256, character(1))
+)
+write.csv(panel_files, file.path(outdir, "panel_checksums.csv"), row.names = FALSE)
+knitr::kable(panel_files)
+```
+
+The 2026-07-21 merged bulk matrix remains an **exploratory source for retained TGN raw counts only**. The old `2_`, `3_`, `4_`, and `6_TG_*.qmd` notebooks still read that matrix directly; their output tables are not the values plotted by this notebook. Figure 2E and S2A/C/D/E are freshly computed from the corrected matrix using their frozen reference/method inputs. Relative-signature weights are reference-relative expression similarities, not cell fractions. Do not infer biological variance from C1/C2 technical sequencing repeats. In particular, S2D's changed absolute score scale requires manuscript and legend reconciliation before submission.
+
+## Session record
+
+```{r}
+#| label: session-record
+sessionInfo()
+```

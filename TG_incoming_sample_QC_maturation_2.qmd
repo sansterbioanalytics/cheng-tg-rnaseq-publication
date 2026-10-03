@@ -1,0 +1,810 @@
+---
+title: "Incoming RNA-seq Sample QC & Weekly Maturation Tracking"
+subtitle: "TG-reference-anchored review of new bulk RNA-seq batches (RealTGN.salmon)"
+author: "Austin Hovland"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+editor: visual
+execute:
+  echo: true
+  warning: false
+  message: false
+  cache: true
+---
+
+## Purpose
+
+This notebook is the recurring intake-QC and maturation-tracking companion to `TG_sc_reprocessing-3.qmd` (single-nucleus reference build) and `TG_reviewer_figures.qmd` (bulk-to-reference projection). It is meant to be re-run every time a new batch of bulk RNA-seq quantifications lands, and does two things:
+
+1.  **Incoming sample QC** — library size, complexity, duplication/composition sanity checks, and similarity to the integrated TG single-nucleus reference, flagging any sample that looks degraded, contaminated, or mislabeled before it enters downstream analysis.
+2.  **Weekly maturation investigation** — tracks the curated marker sets already derived for the TG reference (pan-neuronal, peptidergic/nociceptor, non-peptidergic, neurofilament/mechanosensory, cold/pruriceptor, and the non-neuronal purity programs) across the differentiation time course encoded in each sample's well/week label (e.g. `TGN...W1`, `W2`, ...), so drift or stalled maturation is caught early. Replicates are condensed to one value per specimen x week before any signal is computed. Three complementary, reference-anchored methods are then used together: (a) a correlation-weighted composite gene-signature score per program (learned from the pseudobulk reference, not uniform per-gene weighting), (b) a PCA projection of incoming samples into a *fixed* pseudobulk-reference PCA space, drawn as a weekly trajectory arrow, and (c) an NNLS deconvolution that estimates each sample's transcriptional composition against the pseudobulk reference as a signature matrix. Agreement across all three is treated as the strongest evidence of genuine maturation.
+
+This notebook assumes `TG_sc_reprocessing-3.qmd` has already been run (so `results/pseudobulk/` is populated) and that new bulk counts are available as a Salmon merged gene-counts TSV, following the same layout as `RealTGN.salmon.merged.gene_counts.tsv`.
+
+## Setup
+
+```{r}
+#| label: setup
+
+library(dplyr)
+library(tidyr)
+library(readr)
+library(tibble)
+library(purrr)
+library(stringr)
+library(ggplot2)
+library(ggrepel)
+library(pheatmap)
+library(edgeR)
+
+dir.create("results/incoming_qc", recursive = TRUE, showWarnings = FALSE)
+
+# --- Point this at the newest merged Salmon gene-counts table each week ---
+incoming_counts_path <- "RealTGN.salmon.merged.gene_counts.tsv"
+
+# Reference artifacts produced by TG_sc_reprocessing-3.qmd
+combined_dge <- readRDS(
+  "results/pseudobulk/GSE197289_TG_combined_reference_edgeR_dge.rds"
+)
+
+combined_logcpm <- as.matrix(
+  read.csv(
+    "results/pseudobulk/GSE197289_TG_combined_reference_logCPM.csv",
+    row.names = 1,
+    check.names = FALSE
+  )
+)
+
+combined_metadata <- read_csv(
+  "results/pseudobulk/GSE197289_TG_combined_reference_metadata.csv",
+  show_col_types = FALSE
+)
+
+# Previously derived marker manifest (pan-neuronal, subtype, non-neuronal programs)
+combined_marker_manifest <- read_csv(
+  "results/pseudobulk/GSE197289_TG_combined_marker_manifest.csv",
+  show_col_types = FALSE
+)
+
+stopifnot(identical(colnames(combined_logcpm), combined_metadata$pseudobulk_id))
+```
+
+## Import incoming bulk RNA-seq samples
+
+```{r}
+#| label: import-incoming-samples
+
+incoming_quant <- read_tsv(
+  incoming_counts_path,
+  show_col_types = FALSE
+)
+
+stopifnot(all(c("gene_id", "gene_name") %in% colnames(incoming_quant)))
+
+incoming_sample_ids <- setdiff(colnames(incoming_quant), c("gene_id", "gene_name"))
+
+stopifnot(length(incoming_sample_ids) > 0L)
+
+incoming_counts_tbl <- incoming_quant |>
+  transmute(
+    gene_name = toupper(trimws(gene_name)),
+    across(all_of(incoming_sample_ids), as.numeric)
+  ) |>
+  filter(!is.na(gene_name), gene_name != "") |>
+  group_by(gene_name) |>
+  summarise(
+    across(all_of(incoming_sample_ids), \(x) sum(x, na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+incoming_counts <- incoming_counts_tbl |> as.data.frame()
+rownames(incoming_counts) <- incoming_counts$gene_name
+incoming_counts$gene_name <- NULL
+incoming_counts <- as.matrix(incoming_counts)
+
+stopifnot(!anyDuplicated(rownames(incoming_counts)))
+```
+
+## Parse sample identity and week/maturation timepoint
+
+Sample labels follow the established convention: cohort prefix, then `hDRG_<n>`, `TGN<label>W<week>`, or `TAK<lot>`. The trailing `W<number>` token is parsed out explicitly as the differentiation week for the maturation time course; samples without a parseable week are retained but excluded from the weekly trajectory plots.
+
+```{r}
+#| label: parse-sample-identity
+
+incoming_total_counts <- colSums(incoming_counts)
+incoming_detected_genes <- colSums(incoming_counts > 0)
+
+incoming_sample_metadata <- tibble(
+  sample_id = colnames(incoming_counts)
+) |>
+  mutate(
+    cohort = sub("^([^_]+)_.*$", "\\1", sample_id),
+    sample_label = sub("^[^_]+_", "", sample_id),
+    sample_class = case_when(
+      grepl("^hDRG", sample_label) ~ "hDRG",
+      grepl("^TGN", sample_label) ~ "TG bulk",
+      grepl("^TAK", sample_label) ~ "TAK2204464A",
+      TRUE ~ "Other"
+    ),
+    specimen_id = case_when(
+      grepl("^hDRG_[0-9]+$", sample_label) ~ sub("_[0-9]+$", "", sample_label),
+      grepl("^TGN.*W[0-9]+$", sample_label) ~ sub("W[0-9]+$", "", sample_label),
+      TRUE ~ sample_label
+    ),
+    week_raw = str_extract(sample_label, "W[0-9]+$"),
+    maturation_week = as.integer(str_remove(week_raw, "^W")),
+    total_counts = incoming_total_counts[sample_id],
+    detected_genes = incoming_detected_genes[sample_id],
+    genes_per_million_counts = 1e6 * detected_genes / total_counts
+  )
+
+n_missing_week <- sum(is.na(incoming_sample_metadata$maturation_week))
+
+message(
+  "Samples parsed: ", nrow(incoming_sample_metadata),
+  "\nSamples without a parseable maturation week: ", n_missing_week
+)
+
+knitr::kable(
+  incoming_sample_metadata |>
+    select(sample_id, cohort, sample_class, specimen_id, maturation_week,
+           total_counts, detected_genes),
+  digits = 0
+)
+
+write.csv(
+  incoming_sample_metadata,
+  "results/incoming_qc/incoming_sample_metadata.csv",
+  row.names = FALSE
+)
+```
+
+## Incoming sample QC — library size and complexity
+
+**QC thresholds** below mirror the conservative single-nucleus flags already established in `TG_sc_reprocessing-3.qmd` (`qc_min_counts`, `qc_min_features`) but rescaled for bulk libraries; adjust `bulk_min_total_counts` and `bulk_min_detected_genes` as the pipeline's bulk QC baseline is refined.
+
+```{r}
+#| label: incoming-qc-thresholds
+#| fig-width: 11
+#| fig-height: 5
+
+bulk_min_total_counts <- 5e6
+bulk_min_detected_genes <- 10000L
+
+incoming_sample_metadata <- incoming_sample_metadata |>
+  mutate(
+    qc_low_depth = total_counts < bulk_min_total_counts,
+    qc_low_complexity = detected_genes < bulk_min_detected_genes,
+    qc_flag = qc_low_depth | qc_low_complexity,
+    qc_status = factor(
+      ifelse(qc_flag, "flagged", "retain"),
+      levels = c("retain", "flagged")
+    )
+  )
+
+knitr::kable(
+  incoming_sample_metadata |>
+    filter(qc_flag) |>
+    select(sample_id, sample_class, total_counts, detected_genes,
+           qc_low_depth, qc_low_complexity),
+  digits = 0
+)
+
+ggplot(
+  incoming_sample_metadata,
+  aes(x = total_counts, y = detected_genes, color = sample_class, shape = qc_status)
+) +
+  geom_vline(xintercept = bulk_min_total_counts, linetype = "dashed", color = "grey50") +
+  geom_hline(yintercept = bulk_min_detected_genes, linetype = "dashed", color = "grey50") +
+  geom_point(size = 3, alpha = 0.85) +
+  ggrepel::geom_text_repel(aes(label = sample_id), size = 2.6, max.overlaps = 20, show.legend = FALSE) +
+  scale_x_log10() +
+  labs(
+    title = "Incoming bulk RNA-seq library depth vs. complexity",
+    subtitle = "Dashed lines mark the current bulk QC floor",
+    x = "Total counts (log scale)",
+    y = "Detected genes",
+    color = "Sample class",
+    shape = "QC status"
+  ) +
+  theme_classic()
+
+write.csv(
+  incoming_sample_metadata,
+  "results/incoming_qc/incoming_sample_qc_flags.csv",
+  row.names = FALSE
+)
+```
+
+## Joint normalization with the TG reference
+
+Incoming samples are jointly TMM-normalized with the filtered combined TG pseudobulk reference over their shared gene set, exactly as in `TG_reviewer_figures.qmd`, so every weekly batch lands on the same expression scale as the reference before any similarity or marker comparison is made.
+
+```{r}
+#| label: joint-normalization
+
+reference_gene_key <- toupper(rownames(combined_dge$counts))
+stopifnot(!anyDuplicated(reference_gene_key))
+stopifnot(!anyDuplicated(rownames(incoming_counts)))
+
+shared_gene_key <- intersect(reference_gene_key, rownames(incoming_counts))
+
+reference_counts_shared <- combined_dge$counts[
+  match(shared_gene_key, reference_gene_key), , drop = FALSE
+]
+incoming_counts_shared <- incoming_counts[
+  match(shared_gene_key, rownames(incoming_counts)), , drop = FALSE
+]
+
+rownames(reference_counts_shared) <- shared_gene_key
+rownames(incoming_counts_shared) <- shared_gene_key
+
+stopifnot(identical(rownames(reference_counts_shared), rownames(incoming_counts_shared)))
+stopifnot(nrow(reference_counts_shared) > 10000L)
+
+joint_counts <- cbind(reference_counts_shared, incoming_counts_shared)
+
+joint_sample_metadata <- bind_rows(
+  combined_metadata |>
+    transmute(
+      sample_id = pseudobulk_id,
+      sample_origin = "Reference pseudobulk",
+      reference_label = as.character(reference_label),
+      reference_level = as.character(reference_level),
+      cohort = paste0("donor_", donor),
+      maturation_week = NA_integer_
+    ),
+  incoming_sample_metadata |>
+    transmute(
+      sample_id,
+      sample_origin = "Incoming bulk RNA-seq",
+      reference_label = sample_class,
+      reference_level = specimen_id,
+      cohort,
+      maturation_week
+    )
+)
+
+joint_sample_metadata <- joint_sample_metadata[
+  match(colnames(joint_counts), joint_sample_metadata$sample_id), , drop = FALSE
+]
+stopifnot(identical(colnames(joint_counts), joint_sample_metadata$sample_id))
+
+joint_dge <- DGEList(counts = joint_counts, samples = as.data.frame(joint_sample_metadata))
+joint_dge <- calcNormFactors(joint_dge, method = "TMM")
+joint_logcpm <- cpm(joint_dge, log = TRUE, prior.count = 2)
+
+n_top_var_genes <- 2000
+gene_var <- apply(combined_logcpm, 1, var)
+top_var_genes <- names(sort(gene_var, decreasing = TRUE))[seq_len(min(n_top_var_genes, length(gene_var)))]
+projection_genes <- intersect(toupper(top_var_genes), rownames(joint_logcpm))
+stopifnot(length(projection_genes) >= 500L)
+```
+
+## Incoming sample similarity to TG reference identities
+
+Flags samples whose strongest correlation is not to the expected neuronal program (e.g. contamination, mislabeling, or a maturation arrest that looks non-neuronal transcriptionally).
+
+```{r}
+#| label: incoming-reference-correlation
+#| fig-width: 12
+#| fig-height: 10
+
+incoming_ids <- incoming_sample_metadata$sample_id
+reference_ids <- combined_metadata$pseudobulk_id
+
+incoming_reference_cor <- cor(
+  joint_logcpm[projection_genes, incoming_ids, drop = FALSE],
+  joint_logcpm[projection_genes, reference_ids, drop = FALSE],
+  method = "spearman"
+)
+
+incoming_reference_long <- as.data.frame(as.table(incoming_reference_cor)) |>
+  rename(bulk_sample = Var1, reference_id = Var2, spearman_correlation = Freq) |>
+  left_join(
+    combined_metadata |>
+      transmute(
+        reference_id = pseudobulk_id,
+        reference_label = as.character(reference_label),
+        reference_level = as.character(reference_level)
+      ),
+    by = "reference_id"
+  )
+
+incoming_reference_summary <- incoming_reference_long |>
+  group_by(bulk_sample, reference_label, reference_level) |>
+  summarise(median_correlation = median(spearman_correlation), .groups = "drop") |>
+  arrange(bulk_sample, desc(median_correlation))
+
+incoming_top_matches <- incoming_reference_summary |>
+  group_by(bulk_sample) |>
+  slice_max(order_by = median_correlation, n = 3, with_ties = FALSE) |>
+  ungroup()
+
+knitr::kable(incoming_top_matches, digits = 3)
+
+incoming_expect_neuron_flag <- incoming_top_matches |>
+  group_by(bulk_sample) |>
+  slice_max(order_by = median_correlation, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  transmute(
+    sample_id = as.character(bulk_sample),
+    top_reference_match = reference_label,
+    top_reference_level = reference_level,
+    top_match_correlation = median_correlation,
+    identity_flag = !top_reference_level %in% c("Neuronal subtype")
+  )
+
+knitr::kable(
+  incoming_expect_neuron_flag |> filter(identity_flag),
+  digits = 3
+)
+
+write.csv(
+  incoming_reference_summary,
+  "results/incoming_qc/incoming_bulk_reference_correlation.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  incoming_expect_neuron_flag,
+  "results/incoming_qc/incoming_identity_flags.csv",
+  row.names = FALSE
+)
+```
+
+## Replicate-condensed weekly progression signal
+
+Individual wells/replicates within the same specimen and week add noise to a maturation call. Before any signature or PCA analysis, replicates are condensed to one value per `specimen_id` x `maturation_week`, carrying forward the replicate spread (SD, n) so variability is visible without letting it dominate the trajectory.
+
+```{r}
+#| label: condense-replicates
+
+maturation_markers_present <- combined_marker_manifest |>
+  filter(gene %in% rownames(joint_logcpm))
+
+incoming_logcpm_markers <- joint_logcpm[maturation_markers_present$gene, incoming_ids, drop = FALSE]
+
+replicate_condensed_expr <- incoming_logcpm_markers |>
+  as.data.frame() |>
+  rownames_to_column("gene") |>
+  pivot_longer(-gene, names_to = "sample_id", values_to = "log_cpm") |>
+  left_join(maturation_markers_present, by = "gene") |>
+  left_join(
+    incoming_sample_metadata |> select(sample_id, specimen_id, sample_class, maturation_week),
+    by = "sample_id"
+  ) |>
+  filter(!is.na(maturation_week)) |>
+  group_by(specimen_id, sample_class, maturation_week, marker_group, gene) |>
+  summarise(
+    mean_log_cpm = mean(log_cpm, na.rm = TRUE),
+    sd_log_cpm = sd(log_cpm, na.rm = TRUE),
+    n_replicates = n(),
+    .groups = "drop"
+  )
+
+replicate_summary_counts <- replicate_condensed_expr |>
+  distinct(specimen_id, maturation_week, n_replicates) |>
+  arrange(specimen_id, maturation_week)
+
+knitr::kable(
+  replicate_summary_counts,
+  caption = "Replicate count per specimen x week going into the condensed signal"
+)
+
+write.csv(
+  replicate_condensed_expr,
+  "results/incoming_qc/replicate_condensed_marker_expression.csv",
+  row.names = FALSE
+)
+```
+
+## Composite gene-signature score per program (replicate-condensed)
+
+Rather than an unweighted per-gene z-score band, each marker program is condensed to a single composite signature score per specimen-week using the mean pairwise-correlation-weighted z-score across program genes (genes more representative of the program, i.e. more correlated with the rest of the program in the pseudobulk reference, contribute more). Weights are learned from the pseudobulk reference only, then applied identically to the incoming samples, so a stronger gene doesn't get diluted by a noisy or off-target one within the same program.
+
+```{r}
+#| label: gene-signature-scoring
+
+signature_weights <- map_dfr(unique(maturation_markers_present$marker_group), function(grp) {
+  genes_in_group <- maturation_markers_present |>
+    filter(marker_group == grp) |>
+    pull(gene)
+
+  genes_in_group <- intersect(genes_in_group, rownames(combined_logcpm))
+  if (length(genes_in_group) < 3) {
+    return(tibble(gene = genes_in_group, marker_group = grp, weight = 1))
+  }
+
+  ref_sub <- combined_logcpm[genes_in_group, , drop = FALSE]
+  gene_cor <- cor(t(ref_sub), method = "spearman")
+  mean_cor <- rowMeans(gene_cor) - (1 / nrow(gene_cor))
+  weight <- pmax(mean_cor, 0.05)
+
+  tibble(gene = genes_in_group, marker_group = grp, weight = weight / sum(weight) * length(weight))
+})
+
+incoming_full_z <- joint_logcpm[unique(signature_weights$gene), incoming_ids, drop = FALSE]
+incoming_full_z <- t(scale(t(incoming_full_z)))
+incoming_full_z <- incoming_full_z[apply(incoming_full_z, 1, function(x) all(is.finite(x))), , drop = FALSE]
+
+reference_full_z <- joint_logcpm[rownames(incoming_full_z), reference_ids, drop = FALSE]
+reference_full_z <- t(scale(t(reference_full_z)))
+reference_full_z <- reference_full_z[apply(reference_full_z, 1, function(x) all(is.finite(x))), , drop = FALSE]
+
+shared_sig_genes <- intersect(rownames(incoming_full_z), rownames(reference_full_z))
+signature_weights <- signature_weights |> filter(gene %in% shared_sig_genes)
+
+compute_signature_scores <- function(zmat, weights_df) {
+  map_dfr(unique(weights_df$marker_group), function(grp) {
+    w <- weights_df |> filter(marker_group == grp)
+    genes_here <- intersect(w$gene, rownames(zmat))
+    if (length(genes_here) == 0) return(NULL)
+    w_vec <- w$weight[match(genes_here, w$gene)]
+    score <- colSums(zmat[genes_here, , drop = FALSE] * w_vec) / sum(w_vec)
+    tibble(sample_id = colnames(zmat), marker_group = grp, signature_score = score)
+  })
+}
+
+incoming_signature_scores <- compute_signature_scores(incoming_full_z, signature_weights) |>
+  left_join(
+    incoming_sample_metadata |> select(sample_id, specimen_id, sample_class, maturation_week),
+    by = "sample_id"
+  ) |>
+  filter(!is.na(maturation_week)) |>
+  group_by(specimen_id, sample_class, maturation_week, marker_group) |>
+  summarise(signature_score = mean(signature_score, na.rm = TRUE), .groups = "drop")
+
+reference_signature_scores <- compute_signature_scores(reference_full_z, signature_weights) |>
+  left_join(
+    combined_metadata |> select(pseudobulk_id, reference_label, reference_level) |>
+      rename(sample_id = pseudobulk_id),
+    by = "sample_id"
+  )
+
+reference_signature_band <- reference_signature_scores |>
+  filter(reference_level == "Neuronal subtype") |>
+  group_by(marker_group) |>
+  summarise(
+    reference_mean = mean(signature_score, na.rm = TRUE),
+    reference_low = quantile(signature_score, 0.1, na.rm = TRUE),
+    reference_high = quantile(signature_score, 0.9, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+write.csv(
+  incoming_signature_scores,
+  "results/incoming_qc/weekly_gene_signature_scores.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  reference_signature_band,
+  "results/incoming_qc/pseudobulk_reference_signature_bands.csv",
+  row.names = FALSE
+)
+```
+
+## Weekly progression signal — condensed composite signature trajectory
+
+One line per specimen per program, using the weighted composite signature score above (not raw per-gene z-scores), condensed across replicates and plotted against the pseudobulk-derived neuronal-subtype reference band. This replaces the shallow uniform-weight/shaded-band plot with a signal that reflects which genes in each program are actually informative in the single-cell-derived reference.
+
+```{r}
+#| label: fig-composite-signature-trajectory
+#| fig-width: 13
+#| fig-height: 8
+
+ggplot(
+  incoming_signature_scores,
+  aes(x = maturation_week, y = signature_score, color = specimen_id)
+) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey70") +
+  geom_rect(
+    data = reference_signature_band,
+    aes(ymin = reference_low, ymax = reference_high),
+    xmin = -Inf, xmax = Inf, fill = "grey40", alpha = 0.12, inherit.aes = FALSE
+  ) +
+  geom_hline(
+    data = reference_signature_band,
+    aes(yintercept = reference_mean),
+    linetype = "dotted", color = "grey20", inherit.aes = FALSE
+  ) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2.4) +
+  facet_wrap(~ marker_group, ncol = 3, scales = "free_y") +
+  labs(
+    title = "Replicate-condensed, correlation-weighted signature score by week",
+    subtitle = "Grey band/dotted line = pseudobulk neuronal-subtype reference (10th-90th pct / mean)",
+    x = "Maturation week",
+    y = "Weighted composite signature score",
+    color = "Specimen"
+  ) +
+  theme_classic()
+```
+
+## PCA-based neuronal identity trajectory
+
+PCA is computed on the pseudobulk reference alone (defining "neuronal identity space" from single-cell-derived ground truth), then incoming samples are projected into that fixed space using the reference loadings — this avoids the incoming batch distorting the axes that define identity. Each specimen's weekly trajectory is drawn as an arrow path so maturation reads as directional movement toward the reference neuronal cluster, not just as proximity at one timepoint.
+
+```{r}
+#| label: fig-pca-projection-trajectory
+#| fig-width: 12
+#| fig-height: 9
+
+pca_genes <- projection_genes
+
+reference_pca_input <- t(joint_logcpm[pca_genes, reference_ids, drop = FALSE])
+reference_center <- colMeans(reference_pca_input)
+reference_pca <- prcomp(reference_pca_input, center = TRUE, scale. = FALSE)
+
+incoming_pca_input <- t(joint_logcpm[pca_genes, incoming_ids, drop = FALSE])
+incoming_pca_input_centered <- sweep(incoming_pca_input, 2, reference_center, "-")
+incoming_pca_projected <- incoming_pca_input_centered %*% reference_pca$rotation[, 1:2]
+
+reference_pca_var <- 100 * summary(reference_pca)$importance[2, 1:2]
+
+reference_pca_df <- combined_metadata |>
+  transmute(
+    sample_id = pseudobulk_id,
+    reference_label = as.character(reference_label),
+    reference_level = as.character(reference_level),
+    PC1 = reference_pca$x[pseudobulk_id, 1],
+    PC2 = reference_pca$x[pseudobulk_id, 2]
+  )
+
+incoming_pca_df <- incoming_sample_metadata |>
+  filter(!is.na(maturation_week)) |>
+  transmute(
+    sample_id,
+    specimen_id,
+    sample_class,
+    maturation_week,
+    PC1 = incoming_pca_projected[sample_id, 1],
+    PC2 = incoming_pca_projected[sample_id, 2]
+  ) |>
+  group_by(specimen_id, sample_class, maturation_week) |>
+  summarise(PC1 = mean(PC1), PC2 = mean(PC2), .groups = "drop") |>
+  arrange(specimen_id, maturation_week)
+
+ggplot() +
+  geom_point(
+    data = reference_pca_df,
+    aes(x = PC1, y = PC2, color = reference_label, shape = reference_level),
+    alpha = 0.3, size = 2.6
+  ) +
+  geom_path(
+    data = incoming_pca_df,
+    aes(x = PC1, y = PC2, group = specimen_id),
+    color = "black", linewidth = 0.6,
+    arrow = arrow(length = unit(0.15, "cm"), type = "closed")
+  ) +
+  geom_point(
+    data = incoming_pca_df,
+    aes(x = PC1, y = PC2, fill = maturation_week),
+    shape = 21, color = "black", size = 3.2, stroke = 0.4
+  ) +
+  scale_fill_viridis_c() +
+  labs(
+    title = "Weekly maturation trajectory projected onto the pseudobulk reference PCA space",
+    subtitle = "Reference PCA loadings are fixed; incoming samples are projected (not re-fit), then condensed across replicates per week",
+    x = sprintf("PC1 (%.1f%% ref variance)", reference_pca_var[1]),
+    y = sprintf("PC2 (%.1f%% ref variance)", reference_pca_var[2]),
+    color = "Reference identity",
+    shape = "Reference level",
+    fill = "Week"
+  ) +
+  theme_classic()
+
+write.csv(
+  incoming_pca_df,
+  "results/incoming_qc/weekly_pca_trajectory_coordinates.csv",
+  row.names = FALSE
+)
+```
+
+An arrow path that moves steadily toward the neuronal-subtype cluster over weeks is the clearest single confirmation of on-target maturation this notebook can produce; a path that stalls, reverses, or moves toward a non-neuronal cluster is the strongest available signal for a protocol flag.
+
+## Deconvolution — estimating cell-identity composition per sample
+
+The single-cell-derived pseudobulk reference doubles as a signature matrix. Non-negative least squares (NNLS) deconvolution regresses each incoming sample's expression on the pseudobulk reference profiles (restricted to reference-specific marker genes and the shared gene set), producing a non-negative composition estimate per identity that sums to 1. This is explicitly framed as a transcriptional-purity/composition estimate, not a literal single-cell-resolution cell count, matching the caveat already used for the broad TG pseudobulk reference in `TG_sc_reprocessing-3.qmd`.
+
+```{r}
+#| label: nnls-deconvolution
+
+if (!requireNamespace("nnls", quietly = TRUE)) {
+  install.packages("nnls", repos = "https://cloud.r-project.org")
+}
+library(nnls)
+
+deconv_signature_genes <- combined_marker_manifest |>
+  filter(gene %in% rownames(joint_logcpm)) |>
+  pull(gene) |>
+  unique()
+
+signature_matrix <- 2^joint_logcpm[deconv_signature_genes, reference_ids, drop = FALSE]
+
+signature_identity_map <- combined_metadata |>
+  transmute(pseudobulk_id, reference_label = as.character(reference_label)) |>
+  filter(pseudobulk_id %in% colnames(signature_matrix))
+
+identity_levels <- unique(signature_identity_map$reference_label)
+
+signature_matrix_by_identity <- sapply(identity_levels, function(id_lab) {
+  cols <- signature_identity_map$pseudobulk_id[signature_identity_map$reference_label == id_lab]
+  if (length(cols) == 1) return(signature_matrix[, cols])
+  rowMeans(signature_matrix[, cols, drop = FALSE])
+})
+colnames(signature_matrix_by_identity) <- identity_levels
+
+incoming_linear_expr <- 2^joint_logcpm[deconv_signature_genes, incoming_ids, drop = FALSE]
+
+run_nnls_fraction <- function(sample_expr, sig_matrix) {
+  fit <- nnls::nnls(as.matrix(sig_matrix), as.numeric(sample_expr))
+  coefs <- pmax(fit$x, 0)
+  if (sum(coefs) == 0) coefs <- rep(0, length(coefs))
+  else coefs <- coefs / sum(coefs)
+  names(coefs) <- colnames(sig_matrix)
+  coefs
+}
+
+deconv_fractions <- apply(incoming_linear_expr, 2, run_nnls_fraction, sig_matrix = signature_matrix_by_identity)
+deconv_fractions <- as.data.frame(t(deconv_fractions)) |>
+  rownames_to_column("sample_id")
+
+deconv_long <- deconv_fractions |>
+  pivot_longer(-sample_id, names_to = "reference_identity", values_to = "estimated_fraction") |>
+  left_join(
+    incoming_sample_metadata |> select(sample_id, specimen_id, sample_class, maturation_week),
+    by = "sample_id"
+  ) |>
+  filter(!is.na(maturation_week)) |>
+  group_by(specimen_id, sample_class, maturation_week, reference_identity) |>
+  summarise(estimated_fraction = mean(estimated_fraction, na.rm = TRUE), .groups = "drop")
+
+write.csv(
+  deconv_long,
+  "results/incoming_qc/weekly_nnls_deconvolution_fractions.csv",
+  row.names = FALSE
+)
+
+knitr::kable(
+  deconv_long |> pivot_wider(names_from = reference_identity, values_from = estimated_fraction),
+  digits = 2,
+  caption = "NNLS-estimated composition (fraction) per specimen x week, condensed across replicates"
+)
+```
+
+```{r}
+#| label: fig-deconvolution-stacked-bar
+#| fig-width: 13
+#| fig-height: 7
+
+ggplot(
+  deconv_long,
+  aes(x = factor(maturation_week), y = estimated_fraction, fill = reference_identity)
+) +
+  geom_col(position = "stack") +
+  facet_wrap(~ specimen_id, ncol = 3) +
+  labs(
+    title = "NNLS-estimated transcriptional composition by week",
+    subtitle = "Signature matrix = pseudobulk reference identities restricted to curated marker genes",
+    x = "Maturation week",
+    y = "Estimated fraction",
+    fill = "Reference identity"
+  ) +
+  theme_classic() +
+  theme(legend.position = "bottom")
+```
+
+Rising neuronal-subtype fraction (and falling non-neuronal fraction) across weeks within a specimen is the deconvolution-based counterpart to the PCA trajectory and composite signature score above; agreement across all three methods (signature score, PCA projection, and deconvolution fraction) is the strongest available evidence for genuine maturation, while disagreement between them flags a case worth manual review rather than an automatic accept/reject.
+
+## Week-over-week maturation flags (condensed signal)
+
+Flags are now computed on the **replicate-condensed, correlation-weighted composite signature score** and the **NNLS neuronal-subtype fraction**, rather than an unweighted per-gene z-score, and require agreement between the two before raising a flag — reducing false positives driven by a single noisy program or gene.
+
+```{r}
+#| label: week-over-week-flags
+
+neuronal_programs <- c(
+  "Pan-neuronal", "Peptidergic nociceptor", "Non-peptidergic nociceptor",
+  "Neurofilament / mechanosensory", "Cold / pruriceptor-associated"
+)
+
+non_neuronal_programs <- c("Satellite glia", "Schwann cell", "Fibroblast", "Vascular", "Immune")
+
+signature_flags <- incoming_signature_scores |>
+  arrange(specimen_id, marker_group, maturation_week) |>
+  group_by(specimen_id, marker_group) |>
+  mutate(
+    delta_vs_prior_week = signature_score - lag(signature_score),
+    program_class = case_when(
+      marker_group %in% neuronal_programs ~ "neuronal",
+      marker_group %in% non_neuronal_programs ~ "non_neuronal",
+      TRUE ~ "other"
+    )
+  ) |>
+  ungroup() |>
+  filter(!is.na(delta_vs_prior_week)) |>
+  mutate(
+    stalled_neuronal_flag = program_class == "neuronal" & delta_vs_prior_week <= 0,
+    rising_non_neuronal_flag = program_class == "non_neuronal" & delta_vs_prior_week > 0.15
+  )
+
+neuronal_identity_labels <- combined_metadata |>
+  filter(reference_level == "Neuronal subtype") |>
+  pull(reference_label) |>
+  as.character() |>
+  unique()
+
+deconv_neuronal_fraction <- deconv_long |>
+  mutate(is_neuronal_identity = reference_identity %in% neuronal_identity_labels) |>
+  group_by(specimen_id, sample_class, maturation_week) |>
+  summarise(neuronal_fraction = sum(estimated_fraction[is_neuronal_identity]), .groups = "drop") |>
+  arrange(specimen_id, maturation_week) |>
+  group_by(specimen_id) |>
+  mutate(delta_neuronal_fraction = neuronal_fraction - lag(neuronal_fraction)) |>
+  ungroup()
+
+combined_flag_check <- signature_flags |>
+  filter(program_class == "neuronal") |>
+  group_by(specimen_id, maturation_week) |>
+  summarise(any_neuronal_program_stalled = any(stalled_neuronal_flag), .groups = "drop") |>
+  left_join(deconv_neuronal_fraction, by = c("specimen_id", "maturation_week")) |>
+  mutate(
+    deconv_stalled = !is.na(delta_neuronal_fraction) & delta_neuronal_fraction <= 0,
+    concordant_stall_flag = any_neuronal_program_stalled & deconv_stalled
+  )
+
+knitr::kable(
+  combined_flag_check |> filter(concordant_stall_flag),
+  digits = 3,
+  caption = "Specimen-weeks where BOTH the signature score and NNLS neuronal fraction agree maturation stalled"
+)
+
+write.csv(
+  combined_flag_check,
+  "results/incoming_qc/weekly_maturation_flags_condensed.csv",
+  row.names = FALSE
+)
+```
+
+## Weekly intake summary
+
+```{r}
+#| label: weekly-intake-summary
+
+intake_summary <- tibble(
+  metric = c(
+    "Incoming samples this run",
+    "Samples flagged on depth/complexity QC",
+    "Samples with identity mismatch vs. expected neuronal reference",
+    "Specimen/week combinations with any stalled neuronal signature program",
+    "Specimen/week combinations with a rising non-neuronal signature program",
+    "Specimen/week combinations with concordant signature + NNLS stall flag"
+  ),
+  value = c(
+    nrow(incoming_sample_metadata),
+    sum(incoming_sample_metadata$qc_flag),
+    sum(incoming_expect_neuron_flag$identity_flag),
+    sum(signature_flags$stalled_neuronal_flag),
+    sum(signature_flags$rising_non_neuronal_flag),
+    sum(combined_flag_check$concordant_stall_flag, na.rm = TRUE)
+  )
+)
+
+knitr::kable(intake_summary)
+```
+
+## Next steps checklist
+
+- Any sample flagged in **Incoming sample QC** should be re-checked against the wet-lab log (RIN, input mass, library prep batch) before being pooled into any comparison.
+- Any sample flagged in **Incoming sample similarity to TG reference identities** with `identity_flag = TRUE` should be visually re-inspected in the full similarity heatmap and the anchored marker heatmap in this notebook (and cross-checked against the PCA/heatmap from `TG_reviewer_figures.qmd`) before acceptance.
+- Use the **pseudobulk reference bands** in the per-program maturation score plot as the primary pass/fail anchor for maturation progress — a specimen tracking toward (not just away from zero, but into) the neuronal-subtype reference band by week 4 is the target trajectory; one that plateaus well outside the band warrants a differentiation-protocol review.
+- Any specimen/week combination flagged as **concordant** (both the composite signature score AND the NNLS neuronal fraction stalled or reversed) should trigger a note in the differentiation log; two consecutive concordant-stall weeks for the same specimen is the current trigger for re-derivation review.
+- Treat single-method flags (signature-only or deconvolution-only) as a lower-priority watch item rather than an immediate escalation — cross-check against the PCA trajectory plot before acting.
+- Revisit the correlation-based gene weights and the NNLS signature gene set periodically as more donors/timepoints accumulate in the pseudobulk reference, since both are learned from that reference and will sharpen as it grows.

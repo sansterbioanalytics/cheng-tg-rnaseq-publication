@@ -1,0 +1,739 @@
+---
+title: "Reviewer-Requested Figures: Human TG Pseudobulk Reference (GSE197289)"
+author: "Austin Hovland"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+editor: visual
+execute:
+  echo: true
+  warning: false
+  message: false
+  cache: true
+---
+
+## Context
+
+The parent analysis (`TG_sc_reprocessing-2.qmd`) builds donor-by-subtype and donor-by-broad-cell-type pseudobulk profiles from the human trigeminal ganglion (TG) snRNA-seq dataset GSE197289, TMM-normalizes them with `edgeR`, and visualizes the reference with marker heatmaps and a PCA. Three concerns that reviewers commonly raise about pseudobulk designs like this one are addressed below with new figures:
+
+1.  **Do pseudobulk profiles cluster by biology (cell identity) or by technical/donor batch?** A reviewer will ask for a sample-sample similarity matrix, not just a two-dimensional PCA projection, to justify pooling nuclei across donors within a subtype.
+2.  **How much of the transcriptional variance is attributable to donor vs. cell identity?** Donor is a known confound in any pseudobulk design with only 2-3 donors; reviewers will want a quantitative variance decomposition rather than a qualitative PCA read.
+3.  **Are the low-nuclei-count ("exploratory") pseudobulks reliable, or are they dominated by sampling noise?** The manifest already flags groups between 20-49 nuclei as "exploratory"; a reviewer will want evidence that library complexity has saturated at these group sizes before those pseudobulks are used for any comparison.
+
+This document assumes the parent pipeline has already been run and reads its saved artifacts from `results/pseudobulk/`. The same saved reference is also used below to contextualize the new bulk RNA-seq quantifications in `RealTGN.salmon.merged.gene_counts.tsv` without rebuilding the single-nucleus workflow.
+
+## Setup
+
+```{r}
+#| label: setup
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(ggrepel)
+library(pheatmap)
+library(edgeR)
+library(readr)
+library(tibble)
+library(purrr)
+
+dir.create("results/figures", recursive = TRUE, showWarnings = FALSE)
+
+combined_dge <- readRDS(
+  "results/pseudobulk/GSE197289_TG_combined_reference_edgeR_dge.rds"
+)
+
+combined_logcpm <- as.matrix(
+  read.csv(
+    "results/pseudobulk/GSE197289_TG_combined_reference_logCPM.csv",
+    row.names = 1,
+    check.names = FALSE
+  )
+)
+
+combined_metadata <- read_csv(
+  "results/pseudobulk/GSE197289_TG_combined_reference_metadata.csv",
+  show_col_types = FALSE
+)
+
+pb_library_sizes <- read_csv(
+  "results/pseudobulk/GSE197289_TG_neuron_donor_subtype_library_sizes.csv",
+  show_col_types = FALSE
+)
+
+tg_broad_pb_qc <- read_csv(
+  "results/pseudobulk/GSE197289_TG_broad_type_donor_metadata.csv",
+  show_col_types = FALSE
+)
+
+stopifnot(identical(colnames(combined_logcpm), combined_metadata$pseudobulk_id))
+```
+
+## Figure 1 — Pseudobulk sample-sample correlation heatmap
+
+**Reviewer concern:** "The PCA in Figure X shows separation by cell identity, but with only a handful of donors it is unclear whether replicate pseudobulks from the same subtype are actually more similar to each other than to pseudobulks from a different subtype in the same donor. Please provide a quantitative similarity matrix."
+
+This figure computes pairwise Spearman correlations across all pseudobulk profiles on the most variable genes and displays them as an annotated heatmap, so within-subtype (biological) concordance can be compared directly against within-donor (technical) concordance.
+
+```{r}
+#| label: fig-sample-correlation-heatmap
+#| fig-width: 13
+#| fig-height: 12
+
+n_top_var_genes <- 2000
+
+gene_var <- apply(combined_logcpm, 1, var)
+top_var_genes <- names(sort(gene_var, decreasing = TRUE))[
+  seq_len(min(n_top_var_genes, length(gene_var)))
+]
+
+cor_matrix <- cor(
+  combined_logcpm[top_var_genes, , drop = FALSE],
+  method = "spearman"
+)
+
+stopifnot(identical(rownames(cor_matrix), combined_metadata$pseudobulk_id))
+
+col_annotation <- combined_metadata |>
+  select(pseudobulk_id, donor, reference_level, reference_label, n_nuclei) |>
+  as.data.frame()
+
+rownames(col_annotation) <- col_annotation$pseudobulk_id
+col_annotation$pseudobulk_id <- NULL
+
+pheatmap(
+  cor_matrix,
+  clustering_distance_rows = as.dist(1 - cor_matrix),
+  clustering_distance_cols = as.dist(1 - cor_matrix),
+  annotation_col = col_annotation,
+  annotation_row = col_annotation,
+  show_colnames = TRUE,
+  show_rownames = TRUE,
+  fontsize_row = 7,
+  fontsize_col = 7,
+  border_color = NA,
+  main = sprintf(
+    "Pseudobulk sample-sample Spearman correlation (top %d variable genes)",
+    length(top_var_genes)
+  )
+)
+```
+
+```{r}
+#| label: fig1-within-vs-between-summary
+
+pair_grid <- expand.grid(
+  sample_a = combined_metadata$pseudobulk_id,
+  sample_b = combined_metadata$pseudobulk_id,
+  stringsAsFactors = FALSE
+) |>
+  filter(sample_a != sample_b) |>
+  left_join(
+    combined_metadata |> select(pseudobulk_id, donor, reference_label),
+    by = c("sample_a" = "pseudobulk_id")
+  ) |>
+  rename(donor_a = donor, label_a = reference_label) |>
+  left_join(
+    combined_metadata |> select(pseudobulk_id, donor, reference_label),
+    by = c("sample_b" = "pseudobulk_id")
+  ) |>
+  rename(donor_b = donor, label_b = reference_label) |>
+  mutate(
+    correlation = cor_matrix[cbind(sample_a, sample_b)],
+    pair_type = case_when(
+      label_a == label_b & donor_a != donor_b ~ "Same identity, different donor",
+      label_a == label_b & donor_a == donor_b ~ "Same identity, same donor",
+      label_a != label_b & donor_a == donor_b ~ "Different identity, same donor",
+      TRUE ~ "Different identity, different donor"
+    )
+  )
+
+pair_summary <- pair_grid |>
+  group_by(pair_type) |>
+  summarise(
+    n_pairs = n(),
+    median_correlation = median(correlation),
+    .groups = "drop"
+  ) |>
+  arrange(desc(median_correlation))
+
+knitr::kable(pair_summary, digits = 3)
+
+write.csv(
+  pair_summary,
+  "results/figures/GSE197289_pseudobulk_pairwise_correlation_summary.csv",
+  row.names = FALSE
+)
+```
+
+If "same identity, different donor" pairs correlate more strongly than "different identity, same donor" pairs, that supports pooling nuclei by cell identity across donors rather than the alternative concern that pseudobulk signal is primarily donor-driven.
+
+## Figure 2 — Variance explained by donor vs. cell identity
+
+**Reviewer concern:** "With only two or three donors, how do you know cell identity is not confounded with donor-specific technical variation (e.g. library prep, RNA quality)? A PCA scatterplot alone does not quantify this."
+
+This figure fits a simple variance-partition model per gene (log-CPM \~ donor + cell identity) on the combined pseudobulk reference and summarizes, across the top variable genes, how much variance is attributable to each factor, displayed as a stacked/grouped bar chart with one bar per gene ordered by total explained variance, plus an aggregate summary bar.
+
+```{r}
+#| label: fig-variance-partition
+#| fig-width: 11
+#| fig-height: 6
+
+design_df <- combined_metadata |>
+  transmute(
+    pseudobulk_id,
+    donor = factor(donor),
+    cell_identity = factor(reference_label)
+  )
+
+stopifnot(identical(design_df$pseudobulk_id, colnames(combined_logcpm)))
+
+genes_for_vp <- top_var_genes
+
+variance_partition <- map_dfr(genes_for_vp, function(g) {
+  expr <- combined_logcpm[g, ]
+  df <- design_df |> mutate(expr = expr)
+
+  total_ss <- sum((df$expr - mean(df$expr))^2)
+
+  fit_donor <- aov(expr ~ donor, data = df)
+  fit_identity <- aov(expr ~ cell_identity, data = df)
+  fit_full <- tryCatch(
+    aov(expr ~ donor + cell_identity, data = df),
+    error = function(e) NULL
+  )
+
+  ss_donor <- sum(fit_donor$residuals^2)
+  ss_identity <- sum(fit_identity$residuals^2)
+
+  var_donor <- 1 - ss_donor / total_ss
+  var_identity <- 1 - ss_identity / total_ss
+
+  if (!is.null(fit_full)) {
+    ss_full <- sum(fit_full$residuals^2)
+    var_full <- 1 - ss_full / total_ss
+  } else {
+    var_full <- NA_real_
+  }
+
+  tibble(
+    gene = g,
+    variance_donor = pmax(var_donor, 0),
+    variance_cell_identity = pmax(var_identity, 0),
+    variance_joint_model = var_full
+  )
+})
+
+variance_partition_summary <- variance_partition |>
+  summarise(
+    mean_variance_donor = mean(variance_donor),
+    mean_variance_cell_identity = mean(variance_cell_identity),
+    median_variance_donor = median(variance_donor),
+    median_variance_cell_identity = median(variance_cell_identity)
+  )
+
+knitr::kable(variance_partition_summary, digits = 3)
+
+write.csv(
+  variance_partition,
+  "results/figures/GSE197289_pseudobulk_variance_partition_per_gene.csv",
+  row.names = FALSE
+)
+
+variance_long <- variance_partition |>
+  select(gene, variance_donor, variance_cell_identity) |>
+  pivot_longer(
+    cols = c(variance_donor, variance_cell_identity),
+    names_to = "factor",
+    values_to = "variance_explained"
+  ) |>
+  mutate(
+    factor = recode(
+      factor,
+      variance_donor = "Donor",
+      variance_cell_identity = "Cell identity"
+    )
+  )
+
+ggplot(variance_long, aes(x = variance_explained, fill = factor)) +
+  geom_density(alpha = 0.5) +
+  geom_vline(
+    data = variance_partition_summary |>
+      pivot_longer(
+        cols = c(mean_variance_donor, mean_variance_cell_identity),
+        names_to = "factor",
+        values_to = "mean_value"
+      ) |>
+      mutate(
+        factor = recode(
+          factor,
+          mean_variance_donor = "Donor",
+          mean_variance_cell_identity = "Cell identity"
+        )
+      ),
+    aes(xintercept = mean_value, color = factor),
+    linetype = "dashed",
+    show.legend = FALSE
+  ) +
+  labs(
+    title = "Per-gene variance explained by donor vs. cell identity",
+    subtitle = sprintf(
+      "Top %d variable genes in the combined pseudobulk reference",
+      length(genes_for_vp)
+    ),
+    x = "Fraction of variance explained (single-factor ANOVA R\u00b2)",
+    y = "Density",
+    fill = "Factor",
+    color = "Factor"
+  ) +
+  theme_classic()
+```
+
+Cell identity explaining substantially more variance than donor, across the bulk of the top variable genes, supports treating donor as a manageable covariate rather than a dominant confound in downstream comparisons.
+
+## Figure 3 — Pseudobulk library complexity vs. group size
+
+**Reviewer concern:** "Pseudobulks built from as few as 20 nuclei are labeled 'exploratory' rather than excluded outright. What evidence supports using a 20-nuclei floor instead of a stricter cutoff — has library complexity saturated by that group size?"
+
+This figure plots detected genes (library complexity) against the number of nuclei aggregated into each pseudobulk, for both the neuronal donor-by-subtype and broad non-neuronal donor-by-cell-type profiles, with a saturation curve fit and the "primary" (\>=50 nuclei) vs. "exploratory" (20-49 nuclei) tiers distinguished by color.
+
+```{r}
+#| label: fig-library-complexity-saturation
+#| fig-width: 11
+#| fig-height: 7
+
+complexity_neuronal <- pb_library_sizes |>
+  transmute(
+    pseudobulk_id,
+    donor,
+    reference_label = subtype_author,
+    reference_level = "Neuronal subtype",
+    n_nuclei,
+    total_umis,
+    detected_genes,
+    confidence_tier
+  )
+
+complexity_broad <- tg_broad_pb_qc |>
+  transmute(
+    pseudobulk_id,
+    donor,
+    reference_label = tg_broad_type,
+    reference_level = "Broad non-neuronal",
+    n_nuclei,
+    total_umis,
+    detected_genes,
+    confidence_tier = case_when(
+      n_nuclei >= 50 ~ "primary",
+      n_nuclei >= 20 ~ "exploratory",
+      TRUE ~ "excluded"
+    )
+  )
+
+complexity_combined <- bind_rows(complexity_neuronal, complexity_broad) |>
+  mutate(
+    confidence_tier = factor(
+      confidence_tier,
+      levels = c("primary", "exploratory", "excluded")
+    )
+  )
+
+saturation_fit <- nls(
+  detected_genes ~ SSmicmen(n_nuclei, Vm, K),
+  data = complexity_combined,
+  control = nls.control(maxiter = 200, warnOnly = TRUE)
+)
+
+prediction_grid <- tibble(
+  n_nuclei = seq(
+    min(complexity_combined$n_nuclei),
+    max(complexity_combined$n_nuclei),
+    length.out = 200
+  )
+) |>
+  mutate(detected_genes = predict(saturation_fit, newdata = pick(n_nuclei)))
+
+ggplot(
+  complexity_combined,
+  aes(x = n_nuclei, y = detected_genes)
+) +
+  geom_vline(
+    xintercept = c(20, 50),
+    linetype = "dashed",
+    color = "grey50"
+  ) +
+  geom_line(
+    data = prediction_grid,
+    color = "black",
+    linewidth = 0.6
+  ) +
+  geom_point(
+    aes(color = confidence_tier, shape = reference_level),
+    size = 3,
+    alpha = 0.85
+  ) +
+  ggrepel::geom_text_repel(
+    aes(label = pseudobulk_id),
+    size = 2.6,
+    max.overlaps = 15,
+    show.legend = FALSE
+  ) +
+  scale_x_log10() +
+  labs(
+    title = "Pseudobulk library complexity saturates well below the 20-nuclei floor",
+    subtitle = "Michaelis-Menten saturation fit across all donor-by-identity pseudobulks",
+    x = "Nuclei aggregated per pseudobulk (log scale)",
+    y = "Detected genes",
+    color = "Confidence tier",
+    shape = "Reference level"
+  ) +
+  theme_classic()
+
+write.csv(
+  complexity_combined,
+  "results/figures/GSE197289_pseudobulk_library_complexity.csv",
+  row.names = FALSE
+)
+```
+
+If detected-gene counts plateau near or before the 20-nuclei floor, this figure directly answers the reviewer's cutoff concern; if complexity is still rising steeply at 20-49 nuclei, the "exploratory" label is justified and any conclusions specific to those pseudobulks should be flagged as provisional in the discussion.
+
+## Bulk RNA-seq quantification import
+
+The merged Salmon gene-count table is incorporated downstream of the TG pseudobulk build by aligning bulk samples to the already-filtered combined TG reference feature space. Gene symbols are used as the join key because the reference artifacts were saved with gene-symbol row names.
+
+```{r}
+#| label: bulk-quant-import
+
+bulk_quant <- read_tsv(
+  "RealTGN.salmon.merged.gene_counts.tsv",
+  show_col_types = FALSE
+)
+
+stopifnot(all(c("gene_id", "gene_name") %in% colnames(bulk_quant)))
+
+bulk_sample_ids <- setdiff(colnames(bulk_quant), c("gene_id", "gene_name"))
+
+stopifnot(length(bulk_sample_ids) > 0L)
+
+bulk_counts_tbl <- bulk_quant |>
+  transmute(
+    gene_name = toupper(trimws(gene_name)),
+    across(all_of(bulk_sample_ids), as.numeric)
+  ) |>
+  filter(!is.na(gene_name), gene_name != "") |>
+  group_by(gene_name) |>
+  summarise(
+    across(all_of(bulk_sample_ids), \(x) sum(x, na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+bulk_counts <- bulk_counts_tbl |>
+  as.data.frame()
+
+rownames(bulk_counts) <- bulk_counts$gene_name
+bulk_counts$gene_name <- NULL
+bulk_counts <- as.matrix(bulk_counts)
+
+bulk_total_counts <- colSums(bulk_counts)
+bulk_detected_genes <- colSums(bulk_counts > 0)
+
+bulk_sample_metadata <- tibble(
+  sample_id = colnames(bulk_counts)
+) |>
+  mutate(
+    cohort = sub("^([^_]+)_.*$", "\\1", sample_id),
+    sample_label = sub("^[^_]+_", "", sample_id),
+    sample_class = case_when(
+      grepl("^hDRG", sample_label) ~ "hDRG",
+      grepl("^TGN", sample_label) ~ "TG bulk",
+      grepl("^TAK", sample_label) ~ "TAK2204464A",
+      TRUE ~ "Other"
+    ),
+    specimen_id = case_when(
+      grepl("^hDRG_[0-9]+$", sample_label) ~ sub("_[0-9]+$", "", sample_label),
+      grepl("^TGN.*W[0-9]+$", sample_label) ~ sub("W[0-9]+$", "", sample_label),
+      TRUE ~ sample_label
+    ),
+    total_counts = bulk_total_counts[sample_id],
+    detected_genes = bulk_detected_genes[sample_id]
+  )
+
+reference_gene_key <- toupper(rownames(combined_dge$counts))
+
+stopifnot(!anyDuplicated(reference_gene_key))
+stopifnot(!anyDuplicated(rownames(bulk_counts)))
+
+shared_gene_key <- intersect(reference_gene_key, rownames(bulk_counts))
+
+reference_counts_shared <- combined_dge$counts[
+  match(shared_gene_key, reference_gene_key),
+  ,
+  drop = FALSE
+]
+
+bulk_counts_shared <- bulk_counts[
+  match(shared_gene_key, rownames(bulk_counts)),
+  ,
+  drop = FALSE
+]
+
+rownames(reference_counts_shared) <- shared_gene_key
+rownames(bulk_counts_shared) <- shared_gene_key
+
+stopifnot(identical(rownames(reference_counts_shared), rownames(bulk_counts_shared)))
+stopifnot(nrow(reference_counts_shared) > 10000L)
+
+bulk_import_summary <- tibble(
+  metric = c(
+    "Bulk RNA-seq samples",
+    "Bulk gene rows in input table",
+    "Unique bulk gene symbols",
+    "Reference genes after prior filter",
+    "Shared genes retained for joint normalization"
+  ),
+  value = c(
+    ncol(bulk_counts),
+    nrow(bulk_quant),
+    nrow(bulk_counts),
+    nrow(combined_dge$counts),
+    length(shared_gene_key)
+  )
+)
+
+knitr::kable(bulk_import_summary)
+
+write.csv(
+  bulk_sample_metadata,
+  "results/figures/RealTGN_bulk_sample_metadata.csv",
+  row.names = FALSE
+)
+```
+
+## Figure 4 — Bulk RNA-seq projection onto the integrated TG reference
+
+To place the new bulk samples on the same expression scale as the TG reference, the bulk counts are jointly TMM-normalized with the filtered pseudobulk counts over the shared gene set. PCA is then computed on the reference-defined high-variance genes so the new samples can be interpreted in the same space as the donor-by-identity TG reference.
+
+```{r}
+#| label: fig-bulk-reference-projection
+#| fig-width: 12
+#| fig-height: 8
+
+joint_counts <- cbind(reference_counts_shared, bulk_counts_shared)
+
+joint_sample_metadata <- bind_rows(
+  combined_metadata |>
+    transmute(
+      sample_id = pseudobulk_id,
+      sample_origin = "Reference pseudobulk",
+      reference_label = as.character(reference_label),
+      reference_level = as.character(reference_level),
+      cohort = paste0("donor_", donor),
+      n_nuclei = n_nuclei
+    ),
+  bulk_sample_metadata |>
+    transmute(
+      sample_id,
+      sample_origin = "Bulk RNA-seq",
+      reference_label = sample_class,
+      reference_level = specimen_id,
+      cohort,
+      n_nuclei = NA_integer_
+    )
+)
+
+joint_sample_metadata <- joint_sample_metadata[
+  match(colnames(joint_counts), joint_sample_metadata$sample_id),
+  ,
+  drop = FALSE
+]
+
+stopifnot(identical(colnames(joint_counts), joint_sample_metadata$sample_id))
+
+joint_dge <- DGEList(
+  counts = joint_counts,
+  samples = as.data.frame(joint_sample_metadata)
+)
+
+joint_dge <- calcNormFactors(joint_dge, method = "TMM")
+
+joint_logcpm <- cpm(
+  joint_dge,
+  log = TRUE,
+  prior.count = 2
+)
+
+projection_genes <- intersect(
+  toupper(top_var_genes),
+  rownames(joint_logcpm)
+)
+
+stopifnot(length(projection_genes) >= 500L)
+
+joint_pca <- prcomp(
+  t(joint_logcpm[projection_genes, , drop = FALSE]),
+  center = TRUE,
+  scale. = FALSE
+)
+
+joint_pca_var <- 100 * summary(joint_pca)$importance[2, 1:2]
+
+joint_pca_df <- joint_sample_metadata |>
+  mutate(
+    PC1 = joint_pca$x[sample_id, 1],
+    PC2 = joint_pca$x[sample_id, 2]
+  )
+
+reference_projection_df <- joint_pca_df |>
+  filter(sample_origin == "Reference pseudobulk")
+
+bulk_projection_df <- joint_pca_df |>
+  filter(sample_origin == "Bulk RNA-seq")
+
+ggplot() +
+  geom_point(
+    data = reference_projection_df,
+    aes(x = PC1, y = PC2, color = reference_label),
+    alpha = 0.35,
+    size = 2.4
+  ) +
+  geom_point(
+    data = bulk_projection_df,
+    aes(x = PC1, y = PC2, fill = reference_label, shape = cohort),
+    size = 4,
+    color = "black",
+    stroke = 0.4
+  ) +
+  ggrepel::geom_text_repel(
+    data = bulk_projection_df,
+    aes(x = PC1, y = PC2, label = sample_id),
+    size = 3,
+    max.overlaps = Inf,
+    show.legend = FALSE
+  ) +
+  labs(
+    title = "Bulk TG quantifications projected onto the integrated TG reference",
+    subtitle = sprintf(
+      "Joint TMM normalization across %d shared genes; PCA on %d reference-variable genes",
+      length(shared_gene_key),
+      length(projection_genes)
+    ),
+    x = sprintf("PC1 (%.1f%%)", joint_pca_var[1]),
+    y = sprintf("PC2 (%.1f%%)", joint_pca_var[2]),
+    color = "Reference identity",
+    fill = "Bulk sample class",
+    shape = "Bulk cohort"
+  ) +
+  theme_classic()
+
+write.csv(
+  joint_pca_df,
+  "results/figures/RealTGN_bulk_reference_joint_pca_coordinates.csv",
+  row.names = FALSE
+)
+```
+
+## Figure 5 — Bulk sample similarity to TG reference identities
+
+The PCA provides a global view, but sample-to-reference correlations are easier to interpret for individual bulk samples. This figure summarizes each bulk sample's Spearman correlation to the TG reference after collapsing donor-level pseudobulks within identity, which makes the highest-matching neuronal or non-neuronal programs explicit.
+
+```{r}
+#| label: fig-bulk-to-reference-correlation
+#| fig-width: 12
+#| fig-height: 10
+
+bulk_ids <- bulk_sample_metadata$sample_id
+reference_ids <- combined_metadata$pseudobulk_id
+
+bulk_reference_cor <- cor(
+  joint_logcpm[projection_genes, bulk_ids, drop = FALSE],
+  joint_logcpm[projection_genes, reference_ids, drop = FALSE],
+  method = "spearman"
+)
+
+bulk_reference_long <- as.data.frame(as.table(bulk_reference_cor)) |>
+  rename(
+    bulk_sample = Var1,
+    reference_id = Var2,
+    spearman_correlation = Freq
+  ) |>
+  left_join(
+    combined_metadata |>
+      transmute(
+        reference_id = pseudobulk_id,
+        reference_label = as.character(reference_label),
+        reference_level = as.character(reference_level),
+        donor = as.character(donor)
+      ),
+    by = "reference_id"
+  )
+
+bulk_reference_summary <- bulk_reference_long |>
+  group_by(bulk_sample, reference_label, reference_level) |>
+  summarise(
+    median_correlation = median(spearman_correlation),
+    max_correlation = max(spearman_correlation),
+    .groups = "drop"
+  ) |>
+  arrange(bulk_sample, desc(median_correlation), desc(max_correlation))
+
+bulk_top_matches <- bulk_reference_summary |>
+  group_by(bulk_sample) |>
+  slice_max(order_by = median_correlation, n = 5, with_ties = FALSE) |>
+  ungroup()
+
+knitr::kable(bulk_top_matches, digits = 3)
+
+bulk_reference_matrix <- bulk_reference_summary |>
+  select(bulk_sample, reference_label, median_correlation) |>
+  pivot_wider(
+    names_from = bulk_sample,
+    values_from = median_correlation
+  ) |>
+  as.data.frame()
+
+rownames(bulk_reference_matrix) <- bulk_reference_matrix$reference_label
+bulk_reference_matrix$reference_label <- NULL
+bulk_reference_matrix <- as.matrix(bulk_reference_matrix)
+
+bulk_col_annotation <- bulk_sample_metadata |>
+  select(sample_id, cohort, sample_class, specimen_id) |>
+  as.data.frame()
+
+rownames(bulk_col_annotation) <- bulk_col_annotation$sample_id
+bulk_col_annotation$sample_id <- NULL
+
+bulk_row_annotation <- bulk_reference_summary |>
+  distinct(reference_label, reference_level) |>
+  as.data.frame()
+
+rownames(bulk_row_annotation) <- bulk_row_annotation$reference_label
+bulk_row_annotation$reference_label <- NULL
+
+pheatmap(
+  bulk_reference_matrix,
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  annotation_col = bulk_col_annotation,
+  annotation_row = bulk_row_annotation,
+  border_color = NA,
+  fontsize_row = 8,
+  fontsize_col = 8,
+  main = "Bulk sample similarity to TG reference identities"
+)
+
+write.csv(
+  bulk_reference_summary,
+  "results/figures/RealTGN_bulk_reference_label_correlation.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  bulk_top_matches,
+  "results/figures/RealTGN_bulk_top_reference_matches.csv",
+  row.names = FALSE
+)
+```

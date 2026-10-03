@@ -1,0 +1,387 @@
+---
+title: "Single-Cell Marker Refinement: Empirical Specificity for Neuronal Subtypes"
+subtitle: "Pipeline step 5 of 5 -- run after 1_TG_sc_reprocessing.qmd and 4_TG_deconvolution_diagnostics.qmd; rebuilds the neuronal marker panel from empirical DE rather than literature curation"
+author: "Austin Hovland"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+editor: visual
+execute:
+  echo: true
+  warning: false
+  message: false
+  cache: true
+---
+
+## Purpose
+
+`4_TG_deconvolution_diagnostics.qmd` showed the neuronal-subtype block of the signature matrix (NF1, NF2, NF3, PEP, NP, and related programs) is severely collinear, even though the underlying single-nucleus clusters are clean and well-separated. This notebook goes back to the single-nucleus object and rebuilds the neuronal marker panel from empirical differential expression rather than literature curation, then quantifies whether the expanded panel improves the signature-matrix condition number and VIF.
+
+To avoid further friction, a previously attempted "next-best-neighbor" DE diagnostic that was repeatedly hitting environment/globals edge cases has been removed for now. The focus here is on three robust diagnostics that render reliably:
+
+1.  **Cluster purity check** -- silhouette width per neuronal subtype in PCA space.
+2.  **One-vs-rest differential expression** -- `FindAllMarkers` per subtype, yielding an empirical top-20 marker set.
+3.  **Reduced-dimension effective rank** -- PCA/NMF on the collinear neuronal pseudobulk block and re-running notebook 4's VIF/condition-number on an expanded manifest.
+
+## Setup
+
+```{r}
+#| label: setup
+
+library(Seurat)
+library(SeuratObject)
+library(dplyr)
+library(tidyr)
+library(readr)
+library(tibble)
+library(purrr)
+library(ggplot2)
+library(ggrepel)
+library(pheatmap)
+library(edgeR)
+library(cluster)
+
+if (!requireNamespace("NMF", quietly = TRUE)) {
+  install.packages("NMF", repos = "https://cloud.r-project.org")
+}
+library(NMF)
+
+if (!requireNamespace("nnls", quietly = TRUE)) {
+  install.packages("nnls", repos = "https://cloud.r-project.org")
+}
+library(nnls)
+
+if (requireNamespace("future", quietly = TRUE)) {
+  future::plan("sequential")
+  options(future.globals.maxSize = 4 * 1024^3)
+}
+
+dir.create("results/marker_refinement", recursive = TRUE, showWarnings = FALSE)
+
+tg_neurons_sct <- readRDS("results/seurat/GSE197289_human_TG_neurons_sct.rds")
+
+combined_metadata <- read_csv(
+  "results/pseudobulk/GSE197289_TG_combined_reference_metadata.csv",
+  show_col_types = FALSE
+)
+
+combined_logcpm <- as.matrix(
+  read.csv(
+    "results/pseudobulk/GSE197289_TG_combined_reference_logCPM.csv",
+    row.names = 1,
+    check.names = FALSE
+  )
+)
+
+combined_marker_manifest_original <- read_csv(
+  "results/pseudobulk/GSE197289_TG_combined_marker_manifest.csv",
+  show_col_types = FALSE
+)
+
+baseline_vif_table <- read_csv(
+  "results/deconvolution_diagnostics/signature_matrix_vif.csv",
+  show_col_types = FALSE
+)
+
+collinear_neuronal_subtypes <- baseline_vif_table |>
+  filter(vif >= 10) |>
+  pull(reference_identity) |> unique()
+
+Idents(tg_neurons_sct) <- "subtype_author"
+DefaultAssay(tg_neurons_sct) <- "SCT"
+```
+
+## Diagnostic 1 -- cluster purity at the single-nucleus level
+
+```{r}
+#| label: fig-cluster-purity
+#| fig-width: 10
+#| fig-height: 6
+
+pca_embeddings <- Embeddings(tg_neurons_sct, reduction = "pca")[, 1:30]
+subtype_labels_numeric <- as.integer(factor(tg_neurons_sct$subtype_author))
+
+silhouette_result <- silhouette(subtype_labels_numeric, dist(pca_embeddings))
+
+silhouette_summary <- tibble(
+  subtype_author = tg_neurons_sct$subtype_author,
+  sil_width = silhouette_result[, "sil_width"]
+) |>
+  group_by(subtype_author) |>
+  summarise(
+    mean_silhouette = mean(sil_width),
+    pct_negative_silhouette = mean(sil_width < 0) * 100,
+    n_nuclei = n(),
+    .groups = "drop"
+  ) |>
+  arrange(mean_silhouette)
+
+knitr::kable(silhouette_summary, digits = 3)
+
+ggplot(silhouette_summary, aes(x = reorder(subtype_author, mean_silhouette), y = mean_silhouette, fill = mean_silhouette)) +
+  geom_col() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+  coord_flip() +
+  scale_fill_gradient2(low = "firebrick", mid = "grey80", high = "steelblue", midpoint = 0.15) +
+  labs(
+    title = "Mean silhouette width per author-defined neuronal subtype",
+    subtitle = "Positive = nucleus closer to own subtype centroid than any other; computed on PCA space (30 PCs)",
+    x = NULL, y = "Mean silhouette width", fill = NULL
+  ) +
+  theme_classic()
+
+write.csv(
+  silhouette_summary,
+  "results/marker_refinement/subtype_silhouette_purity.csv",
+  row.names = FALSE
+)
+```
+
+## Diagnostic 2 -- one-vs-rest differential expression
+
+```{r}
+#| label: one-vs-rest-de
+#| cache: true
+
+one_vs_rest_markers <- FindAllMarkers(
+  tg_neurons_sct,
+  assay = "SCT",
+  only.pos = TRUE,
+  min.pct = 0.25,
+  logfc.threshold = 0.5,
+  test.use = "wilcox",
+  verbose = FALSE
+) |>
+  as_tibble() |>
+  rename(subtype_author = cluster) |>
+  filter(p_val_adj < 0.05) |>
+  arrange(subtype_author, desc(avg_log2FC))
+
+one_vs_rest_top20 <- one_vs_rest_markers |>
+  group_by(subtype_author) |>
+  slice_max(order_by = avg_log2FC, n = 20, with_ties = FALSE) |>
+  ungroup()
+
+knitr::kable(
+  one_vs_rest_top20 |>
+    group_by(subtype_author) |>
+    summarise(top_genes = paste(gene, collapse = ", "), .groups = "drop"),
+  caption = "Top 20 one-vs-rest markers per neuronal subtype (empirical, this dataset)"
+)
+
+write.csv(
+  one_vs_rest_markers,
+  "results/marker_refinement/one_vs_rest_de_full.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  one_vs_rest_top20,
+  "results/marker_refinement/one_vs_rest_de_top20.csv",
+  row.names = FALSE
+)
+```
+
+## Diagnostic 3 -- effective rank of the collinear neuronal block
+
+```{r}
+#| label: fig-effective-rank
+#| fig-width: 11
+#| fig-height: 5
+
+neuronal_block_matrix <- sapply(collinear_neuronal_subtypes, function(subtype) {
+  cols <- combined_metadata$pseudobulk_id[
+    combined_metadata$reference_label == subtype &
+      combined_metadata$pseudobulk_id %in% colnames(combined_logcpm)
+  ]
+  if (length(cols) == 1) combined_logcpm[, cols] else rowMeans(combined_logcpm[, cols, drop = FALSE])
+})
+
+variable_gene_var <- apply(neuronal_block_matrix, 1, var)
+
+top_variable_genes <- names(sort(variable_gene_var, decreasing = TRUE))[1:min(2000, length(variable_gene_var))]
+
+neuronal_block_pca <- prcomp(t(neuronal_block_matrix[top_variable_genes, ]), scale. = TRUE)
+
+pca_variance_explained <- tibble(
+  pc = factor(paste0("PC", seq_along(neuronal_block_pca$sdev)), levels = paste0("PC", seq_along(neuronal_block_pca$sdev))),
+  variance_explained = neuronal_block_pca$sdev^2 / sum(neuronal_block_pca$sdev^2),
+  cumulative_variance = cumsum(neuronal_block_pca$sdev^2) / sum(neuronal_block_pca$sdev^2)
+)
+
+knitr::kable(pca_variance_explained, digits = 3)
+
+ggplot(pca_variance_explained, aes(x = pc, y = cumulative_variance, group = 1)) +
+  geom_line() +
+  geom_point(size = 2) +
+  geom_hline(yintercept = 0.9, linetype = "dashed", color = "grey40") +
+  labs(
+    title = "Cumulative variance explained across collinear neuronal subtypes",
+    subtitle = "Dashed line = 90% variance; the PC count crossing it is the effective linear rank of this block",
+    x = NULL, y = "Cumulative variance explained"
+  ) +
+  theme_classic()
+
+nonneg_block_matrix <- pmax(neuronal_block_matrix[top_variable_genes, ] - min(neuronal_block_matrix[top_variable_genes, ]), 1e-6)
+
+nmf_ranks_to_test <- 2:min(length(collinear_neuronal_subtypes), 6)
+
+nmf_fit_quality <- map_dfr(nmf_ranks_to_test, function(k) {
+  fit <- nmf(nonneg_block_matrix, rank = k, seed = 197289, .options = "v0")
+  tibble(rank = k, residual_rss = sum((nonneg_block_matrix - fitted(fit))^2))
+})
+
+knitr::kable(nmf_fit_quality, digits = 1, caption = "NMF residual sum-of-squares by rank (elbow = effective non-negative rank)")
+
+write.csv(
+  pca_variance_explained,
+  "results/marker_refinement/neuronal_block_pca_variance.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  nmf_fit_quality,
+  "results/marker_refinement/neuronal_block_nmf_rank.csv",
+  row.names = FALSE
+)
+```
+
+## Expanded marker manifest and re-running VIF diagnostics
+
+```{r}
+#| label: expanded-marker-manifest
+
+expanded_neuronal_markers <- one_vs_rest_top20 |>
+  transmute(gene, marker_group = subtype_author)
+
+non_neuronal_markers_original <- combined_marker_manifest_original |>
+  filter(!marker_group %in% unique(tg_neurons_sct$subtype_author))
+
+expanded_marker_manifest <- bind_rows(
+  expanded_neuronal_markers |> select(gene, marker_group),
+  non_neuronal_markers_original |> select(gene, marker_group)
+) |>
+  distinct(gene, marker_group, .keep_all = TRUE) |>
+  filter(gene %in% rownames(combined_logcpm))
+
+manifest_comparison <- tibble(
+  metric = c("Original manifest size", "Expanded manifest size", "Net new neuronal markers added"),
+  value = c(
+    nrow(combined_marker_manifest_original),
+    nrow(expanded_marker_manifest),
+    nrow(expanded_neuronal_markers |> anti_join(combined_marker_manifest_original, by = c("gene", "marker_group")))
+  )
+)
+
+knitr::kable(manifest_comparison)
+
+write.csv(
+  expanded_marker_manifest,
+  "results/marker_refinement/GSE197289_TG_expanded_marker_manifest.csv",
+  row.names = FALSE
+)
+```
+
+```{r}
+#| label: fig-refit-vif-comparison
+#| fig-width: 10
+#| fig-height: 6
+
+rebuild_signature_matrix <- function(manifest, logcpm_matrix, metadata) {
+  genes <- manifest |> filter(gene %in% rownames(logcpm_matrix)) |> pull(gene) |> unique()
+  linear_expr <- 2^logcpm_matrix[genes, , drop = FALSE]
+  id_map <- metadata |>
+    transmute(pseudobulk_id, reference_label = as.character(reference_label)) |>
+    filter(pseudobulk_id %in% colnames(linear_expr))
+  identity_levels <- unique(id_map$reference_label)
+  sig <- sapply(identity_levels, function(id_lab) {
+    cols <- id_map$pseudobulk_id[id_map$reference_label == id_lab]
+    if (length(cols) == 1) linear_expr[, cols] else rowMeans(linear_expr[, cols, drop = FALSE])
+  })
+  colnames(sig) <- identity_levels
+  sig
+}
+
+compute_vif <- function(x) {
+  vif_out <- map_dbl(seq_len(ncol(x)), function(i) {
+    y <- x[, i]
+    preds <- x[, -i, drop = FALSE]
+    fit <- lm(y ~ preds)
+    r2 <- summary(fit)$r.squared
+    if (r2 >= 0.999999) return(Inf)
+    1 / (1 - r2)
+  })
+  names(vif_out) <- colnames(x)
+  vif_out
+}
+
+expanded_signature_matrix <- rebuild_signature_matrix(expanded_marker_manifest, combined_logcpm, combined_metadata)
+expanded_log_signature <- log2(expanded_signature_matrix + 1)
+
+expanded_vif <- compute_vif(expanded_log_signature)
+expanded_condition_number <- kappa(expanded_log_signature, exact = TRUE)
+
+vif_before_after <- baseline_vif_table |>
+  select(reference_identity, vif_before = vif) |>
+  inner_join(
+    tibble(reference_identity = names(expanded_vif), vif_after = expanded_vif),
+    by = "reference_identity"
+  ) |>
+  arrange(vif_before)
+
+knitr::kable(vif_before_after, digits = 2)
+
+message(
+  "Condition number before (combined manifest): ", round(kappa(log2(expanded_signature_matrix + 1), exact = TRUE), 1),
+  " | after (expanded manifest): ", round(expanded_condition_number, 1)
+)
+
+vif_before_after_long <- vif_before_after |>
+  pivot_longer(c(vif_before, vif_after), names_to = "stage", values_to = "vif") |>
+  mutate(stage = recode(stage, vif_before = "Original manifest", vif_after = "Expanded manifest"))
+
+ggplot(vif_before_after_long, aes(x = reference_identity, y = vif, fill = stage)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6) +
+  geom_hline(yintercept = 10, linetype = "dashed", color = "firebrick") +
+  labs(
+    title = "VIF before vs. after empirical marker expansion",
+    subtitle = "Dashed line = severe-collinearity threshold (VIF = 10)",
+    x = NULL, y = "Variance inflation factor", fill = NULL
+  ) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+write.csv(
+  vif_before_after,
+  "results/marker_refinement/vif_before_after_expansion.csv",
+  row.names = FALSE
+)
+```
+
+## Summary and verdict
+
+```{r}
+#| label: refinement-summary
+
+refinement_summary <- tibble(
+  metric = c(
+    "Mean silhouette width, collinear neuronal subtypes",
+    "Mean VIF before expansion",
+    "Mean VIF after expansion",
+    "Net new empirically-specific markers added",
+    "PCs needed for 90% variance in collinear block"
+  ),
+  value = c(
+    round(mean(silhouette_summary$mean_silhouette[silhouette_summary$subtype_author %in% collinear_neuronal_subtypes]), 3),
+    round(mean(vif_before_after$vif_before), 2),
+    round(mean(vif_before_after$vif_after), 2),
+    nrow(expanded_neuronal_markers |> anti_join(combined_marker_manifest_original, by = c("gene", "marker_group"))),
+    min(which(pca_variance_explained$cumulative_variance >= 0.9))
+  )
+)
+
+knitr::kable(refinement_summary)
+```

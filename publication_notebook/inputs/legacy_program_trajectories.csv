@@ -1,0 +1,157 @@
+specimen_id,maturation_week,axis,score
+TGN1003A,1,Program: Cold / pruriceptor-associated,0.140399007960233
+TGN1003A,1,Program: Neurofilament / mechanosensory,-0.23987986649786
+TGN1003A,1,Program: Non-peptidergic nociceptor,-0.39721385670692
+TGN1003A,1,Program: Pan-neuronal,0.63544951154222
+TGN1003A,1,Program: Peptidergic nociceptor,-0.53499985706215
+TGN1003A,1,Program: Satellite glia,-0.326714940575822
+TGN1003A,1,Program: Schwann cell,-0.345505943674066
+TGN1003A,2,Program: Cold / pruriceptor-associated,-0.00923710526297458
+TGN1003A,2,Program: Neurofilament / mechanosensory,-0.143684671256475
+TGN1003A,2,Program: Non-peptidergic nociceptor,-0.135133450302884
+TGN1003A,2,Program: Pan-neuronal,0.152974731558006
+TGN1003A,2,Program: Peptidergic nociceptor,-0.200286144161155
+TGN1003A,2,Program: Satellite glia,-0.420036770099265
+TGN1003A,2,Program: Schwann cell,-0.122490919790913
+TGN1003A,3,Program: Cold / pruriceptor-associated,-0.230997353655113
+TGN1003A,3,Program: Neurofilament / mechanosensory,-0.237771717339874
+TGN1003A,3,Program: Non-peptidergic nociceptor,-0.0430057993912671
+TGN1003A,3,Program: Pan-neuronal,-0.0282355374520853
+TGN1003A,3,Program: Peptidergic nociceptor,-0.330230100012223
+TGN1003A,3,Program: Satellite glia,-0.607016082565309
+TGN1003A,3,Program: Schwann cell,-0.248162389523486
+TGN1003A,4,Program: Cold / pruriceptor-associated,-0.21687531547826
+TGN1003A,4,Program: Neurofilament / mechanosensory,0.139712123063534
+TGN1003A,4,Program: Non-peptidergic nociceptor,-0.246850759914002
+TGN1003A,4,Program: Pan-neuronal,-0.199424814730203
+TGN1003A,4,Program: Peptidergic nociceptor,-0.315293369574204
+TGN1003A,4,Program: Satellite glia,-0.54038373943258
+TGN1003A,4,Program: Schwann cell,-0.28725402612837603
+TGN1028B,1,Program: Cold / pruriceptor-associated,0.16690149322467
+TGN1028B,1,Program: Neurofilament / mechanosensory,-0.279370236190452
+TGN1028B,1,Program: Non-peptidergic nociceptor,-0.488218133493573
+TGN1028B,1,Program: Pan-neuronal,0.722250780388819
+TGN1028B,1,Program: Peptidergic nociceptor,-0.17028677822096
+TGN1028B,1,Program: Satellite glia,-0.339677967521737
+TGN1028B,1,Program: Schwann cell,-0.261936167173849
+TGN1028B,2,Program: Cold / pruriceptor-associated,-0.0768180783343695
+TGN1028B,2,Program: Neurofilament / mechanosensory,-0.20252372591262
+TGN1028B,2,Program: Non-peptidergic nociceptor,-0.270881875462293
+TGN1028B,2,Program: Pan-neuronal,0.375104398110668
+TGN1028B,2,Program: Peptidergic nociceptor,-0.0204134612454031
+TGN1028B,2,Program: Satellite glia,-0.457674838876789
+TGN1028B,2,Program: Schwann cell,-0.300573465281683
+TGN1028B,3,Program: Cold / pruriceptor-associated,-0.506930382704722
+TGN1028B,3,Program: Neurofilament / mechanosensory,-0.152941630202706
+TGN1028B,3,Program: Non-peptidergic nociceptor,-0.292310003476439
+TGN1028B,3,Program: Pan-neuronal,0.257537514804879
+TGN1028B,3,Program: Peptidergic nociceptor,-0.136939776020758
+TGN1028B,3,Program: Satellite glia,-0.447717340046382
+TGN1028B,3,Program: Schwann cell,-0.153476789346059
+TGN1028B,4,Program: Cold / pruriceptor-associated,-0.393671266074425
+TGN1028B,4,Program: Neurofilament / mechanosensory,-0.0592361759061096
+TGN1028B,4,Program: Non-peptidergic nociceptor,-0.406137514097973
+TGN1028B,4,Program: Pan-neuronal,0.0365460007561468
+TGN1028B,4,Program: Peptidergic nociceptor,-0.278938019916532
+TGN1028B,4,Program: Satellite glia,-0.633665809587314
+TGN1028B,4,Program: Schwann cell,-0.543836842552258
+TGN1215AvX,1,Program: Cold / pruriceptor-associated,0.266205648555541
+TGN1215AvX,1,Program: Neurofilament / mechanosensory,-0.128620241527757
+TGN1215AvX,1,Program: Non-peptidergic nociceptor,-0.313653375071537
+TGN1215AvX,1,Program: Pan-neuronal,0.856931644535116
+TGN1215AvX,1,Program: Peptidergic nociceptor,-0.0467026776612121
+TGN1215AvX,1,Program: Satellite glia,-0.369907887648886
+TGN1215AvX,1,Program: Schwann cell,-0.199595658743975
+TGN1215AvX,2,Program: Cold / pruriceptor-associated,0.162056551164229
+TGN1215AvX,2,Program: Neurofilament / mechanosensory,-0.215300684970947
+TGN1215AvX,2,Program: Non-peptidergic nociceptor,-0.406368544926685
+TGN1215AvX,2,Program: Pan-neuronal,0.257989463239758
+TGN1215AvX,2,Program: Peptidergic nociceptor,-0.248856504998434
+TGN1215AvX,2,Program: Satellite glia,-0.382829723881243
+TGN1215AvX,2,Program: Schwann cell,-0.411796197711846
+TGN1215AvX,3,Program: Cold / pruriceptor-associated,-0.0702877588224012
+TGN1215AvX,3,Program: Neurofilament / mechanosensory,-0.0110652445072959
+TGN1215AvX,3,Program: Non-peptidergic nociceptor,-0.569512679076749
+TGN1215AvX,3,Program: Pan-neuronal,0.174318977274503
+TGN1215AvX,3,Program: Peptidergic nociceptor,-0.254591105903639
+TGN1215AvX,3,Program: Satellite glia,-0.522562736433339
+TGN1215AvX,3,Program: Schwann cell,-0.427640733933696
+TGN1215AvX,4,Program: Cold / pruriceptor-associated,-0.0469939091387875
+TGN1215AvX,4,Program: Neurofilament / mechanosensory,0.20364870484178
+TGN1215AvX,4,Program: Non-peptidergic nociceptor,-0.488926276774101
+TGN1215AvX,4,Program: Pan-neuronal,0.135238076548011
+TGN1215AvX,4,Program: Peptidergic nociceptor,-0.0314070740633978
+TGN1215AvX,4,Program: Satellite glia,-0.614280429684864
+TGN1215AvX,4,Program: Schwann cell,-0.297436167996213
+TGN1003A,1,"Reference axis: A-beta-LTMR-like
+NF2_SC03; NTRK3/PVALB",0.0953908532948547
+TGN1003A,1,"Reference axis: A-delta-LTMR-like
+NF3_SC02; NTRK2/PIEZO2",-0.787331520609422
+TGN1003A,1,"Reference axis: C-LTMR-like
+cLTMR_SC01; CASQ2/P2RY1",1.39139941904097
+TGN1003A,2,"Reference axis: A-beta-LTMR-like
+NF2_SC03; NTRK3/PVALB",-0.120764575225238
+TGN1003A,2,"Reference axis: A-delta-LTMR-like
+NF3_SC02; NTRK2/PIEZO2",-0.581461135331595
+TGN1003A,2,"Reference axis: C-LTMR-like
+cLTMR_SC01; CASQ2/P2RY1",1.31338954838971
+TGN1003A,3,"Reference axis: A-beta-LTMR-like
+NF2_SC03; NTRK3/PVALB",-0.108440324297877
+TGN1003A,3,"Reference axis: A-delta-LTMR-like
+NF3_SC02; NTRK2/PIEZO2",-0.632873400853888
+TGN1003A,3,"Reference axis: C-LTMR-like
+cLTMR_SC01; CASQ2/P2RY1",1.17318474917542
+TGN1003A,4,"Reference axis: A-beta-LTMR-like
+NF2_SC03; NTRK3/PVALB",0.196161163595378
+TGN1003A,4,"Reference axis: A-delta-LTMR-like
+NF3_SC02; NTRK2/PIEZO2",-0.575441623722829
+TGN1003A,4,"Reference axis: C-LTMR-like
+cLTMR_SC01; CASQ2/P2RY1",1.29827237485369
+TGN1028B,1,"Reference axis: A-beta-LTMR-like
+NF2_SC03; NTRK3/PVALB",0.00366684429052488
+TGN1028B,1,"Reference axis: A-delta-LTMR-like
+NF3_SC02; NTRK2/PIEZO2",-0.853249789793609
+TGN1028B,1,"Reference axis: C-LTMR-like
+cLTMR_SC01; CASQ2/P2RY1",1.4094078640054
+TGN1028B,2,"Reference axis: A-beta-LTMR-like
+NF2_SC03; NTRK3/PVALB",-0.123453080229171
+TGN1028B,2,"Reference axis: A-delta-LTMR-like
+NF3_SC02; NTRK2/PIEZO2",-0.690953531384841
+TGN1028B,2,"Reference axis: C-LTMR-like
+cLTMR_SC01; CASQ2/P2RY1",1.26095385970838
+TGN1028B,3,"Reference axis: A-beta-LTMR-like
+NF2_SC03; NTRK3/PVALB",0.502915445108665
+TGN1028B,3,"Reference axis: A-delta-LTMR-like
+NF3_SC02; NTRK2/PIEZO2",-0.568420918007118
+TGN1028B,3,"Reference axis: C-LTMR-like
+cLTMR_SC01; CASQ2/P2RY1",1.36568660674018
+TGN1028B,4,"Reference axis: A-beta-LTMR-like
+NF2_SC03; NTRK3/PVALB",-0.0282533996553587
+TGN1028B,4,"Reference axis: A-delta-LTMR-like
+NF3_SC02; NTRK2/PIEZO2",-0.627661063285083
+TGN1028B,4,"Reference axis: C-LTMR-like
+cLTMR_SC01; CASQ2/P2RY1",1.29096437745993
+TGN1215AvX,1,"Reference axis: A-beta-LTMR-like
+NF2_SC03; NTRK3/PVALB",-0.0868022647975289
+TGN1215AvX,1,"Reference axis: A-delta-LTMR-like
+NF3_SC02; NTRK2/PIEZO2",-0.921725917680994
+TGN1215AvX,1,"Reference axis: C-LTMR-like
+cLTMR_SC01; CASQ2/P2RY1",1.4792298045984
+TGN1215AvX,2,"Reference axis: A-beta-LTMR-like
+NF2_SC03; NTRK3/PVALB",-0.348226664817495
+TGN1215AvX,2,"Reference axis: A-delta-LTMR-like
+NF3_SC02; NTRK2/PIEZO2",-0.635473167080846
+TGN1215AvX,2,"Reference axis: C-LTMR-like
+cLTMR_SC01; CASQ2/P2RY1",1.38264879016582
+TGN1215AvX,3,"Reference axis: A-beta-LTMR-like
+NF2_SC03; NTRK3/PVALB",-0.356158839614242
+TGN1215AvX,3,"Reference axis: A-delta-LTMR-like
+NF3_SC02; NTRK2/PIEZO2",-0.757288509679181
+TGN1215AvX,3,"Reference axis: C-LTMR-like
+cLTMR_SC01; CASQ2/P2RY1",1.32256020793265
+TGN1215AvX,4,"Reference axis: A-beta-LTMR-like
+NF2_SC03; NTRK3/PVALB",-0.376649370012165
+TGN1215AvX,4,"Reference axis: A-delta-LTMR-like
+NF3_SC02; NTRK2/PIEZO2",-0.834184641687182
+TGN1215AvX,4,"Reference axis: C-LTMR-like
+cLTMR_SC01; CASQ2/P2RY1",1.29242318107926

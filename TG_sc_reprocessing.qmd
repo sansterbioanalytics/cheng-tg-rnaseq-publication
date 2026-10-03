@@ -1,0 +1,1518 @@
+---
+title: "Human Trigeminal Ganglion Reference: GSE197289"
+author: "Austin Hovland"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+editor: visual
+execute:
+  echo: true
+  warning: false
+  message: false
+  cache: true
+---
+
+## Objective
+
+Construct a reproducible Seurat v5 object from the processed human TG snRNA-seq
+counts and barcode metadata released with GSE197289.
+
+The source matrix is genes × nuclei. The metadata file contains the cell barcode
+in `V1`, which is renamed to `barcode` below. The `cellID` field is an
+author-provided label and is not unique.
+
+## Setup
+
+```{r}
+#| label: setup
+
+library(Seurat)
+library(SeuratObject)
+library(Matrix)
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(glmGamPoi)
+library(edgeR)
+library(pheatmap)
+library(ggrepel)
+
+set.seed(197289)
+
+counts_path <- "GSE197289_snRNA-seq_human_raw_counts.RDS/GSE197289_snRNA-seq_human_raw_counts.RDS"
+meta_path <- "GSE197289_snRNA-seq_human_barcode_meta.csv/GSE197289_snRNA-seq_human_barcode_meta.csv"
+
+dir.create("results", showWarnings = FALSE)
+dir.create("results/qc", recursive = TRUE, showWarnings = FALSE)
+dir.create("results/seurat", recursive = TRUE, showWarnings = FALSE)
+dir.create("results/pseudobulk", recursive = TRUE, showWarnings = FALSE)
+
+package_versions <- tibble(
+  package = c(
+    "Seurat", "SeuratObject", "Matrix", "readr", "dplyr",
+    "ggplot2", "patchwork", "glmGamPoi", "edgeR",
+    "pheatmap", "ggrepel"
+  ),
+  version = vapply(
+    c(
+      "Seurat", "SeuratObject", "Matrix", "readr", "dplyr",
+      "ggplot2", "patchwork", "glmGamPoi", "edgeR",
+      "pheatmap", "ggrepel"
+    ),
+    \(pkg) as.character(packageVersion(pkg)),
+    character(1)
+  )
+)
+
+knitr::kable(package_versions)
+```
+
+## Import and validate
+
+```{r}
+#| label: import-validate
+
+counts <- readRDS(counts_path)
+
+meta <- read_csv(
+  meta_path,
+  show_col_types = FALSE
+) |>
+  rename(barcode = V1) |>
+  as.data.frame()
+
+stopifnot(inherits(counts, "dgCMatrix"))
+stopifnot(!is.null(rownames(counts)))
+stopifnot(!is.null(colnames(counts)))
+stopifnot(!anyDuplicated(rownames(counts)))
+stopifnot(!anyDuplicated(colnames(counts)))
+
+stopifnot("barcode" %in% colnames(meta))
+stopifnot(!anyDuplicated(meta$barcode))
+stopifnot(ncol(counts) == nrow(meta))
+stopifnot(setequal(colnames(counts), meta$barcode))
+
+dataset_dimensions <- tibble(
+  metric = c("Genes", "Nuclei", "Metadata rows", "Unique count-matrix barcodes"),
+  value = c(
+    nrow(counts),
+    ncol(counts),
+    nrow(meta),
+    length(unique(colnames(counts)))
+  )
+)
+
+knitr::kable(dataset_dimensions)
+```
+
+## Align metadata
+
+```{r}
+#| label: align-metadata
+
+barcode_idx <- match(colnames(counts), meta$barcode)
+
+stopifnot(!anyNA(barcode_idx))
+stopifnot(length(barcode_idx) == ncol(counts))
+
+# dplyr::slice avoids RStudio's occasional issue with `df[i, , drop = FALSE]`
+meta <- dplyr::slice(meta, barcode_idx)
+meta <- as.data.frame(meta)
+
+stopifnot(identical(meta$barcode, colnames(counts)))
+
+rownames(meta) <- meta$barcode
+
+stopifnot(identical(rownames(meta), colnames(counts)))
+
+knitr::kable(
+  meta |>
+    select(
+      barcode, ganglia, class, cellID, subtype,
+      donor, library, nCount_RNA, nFeature_RNA, percent.mt
+    ) |>
+    head(10)
+)
+```
+
+## Create Seurat object
+
+```{r}
+#| label: create-seurat-object
+
+tg <- CreateSeuratObject(
+  counts = counts,
+  meta.data = meta,
+  project = "GSE197289_human_TG",
+  assay = "RNA",
+  min.cells = 0,
+  min.features = 0
+)
+
+# Preserve original GEO annotation and supplied QC fields.
+tg$author_label_short <- tg$cellID
+tg$cell_type_author <- factor(tg$class)
+tg$subtype_author <- factor(tg$subtype)
+tg$percent_mt_author <- tg$percent.mt
+tg$nCount_RNA_author <- tg$nCount_RNA
+tg$nFeature_RNA_author <- tg$nFeature_RNA
+
+# Declare covariates.
+tg$donor <- factor(tg$donor)
+tg$library <- factor(tg$library)
+tg$ganglia <- factor(tg$ganglia)
+
+# Required data-integrity checks.
+stopifnot(identical(colnames(tg), rownames(tg[[]])))
+stopifnot(ncol(tg) == 38028L)
+stopifnot(nrow(tg) == 32214L)
+
+print(tg)
+```
+## Annotation audit
+
+```{r}
+#| label: annotation-audit
+
+broad_annotation <- tg[[]] |>
+  count(cell_type_author, name = "n_nuclei") |>
+  arrange(desc(n_nuclei))
+
+subtype_annotation <- tg[[]] |>
+  count(subtype_author, name = "n_nuclei") |>
+  arrange(desc(n_nuclei))
+
+donor_by_class <- tg[[]] |>
+  count(donor, cell_type_author, name = "n_nuclei") |>
+  arrange(donor, desc(n_nuclei))
+
+knitr::kable(broad_annotation)
+knitr::kable(subtype_annotation)
+knitr::kable(donor_by_class)
+
+write.csv(
+  subtype_annotation,
+  "results/qc/GSE197289_subtype_author_counts.csv",
+  row.names = FALSE
+)
+```
+
+## Recalculate QC metrics
+
+The original metadata contains author-provided counts, detected features, and
+mitochondrial percentage. Recalculate mitochondrial, ribosomal, and hemoglobin
+percentages from the supplied matrix for audit purposes. No cells are removed
+at this stage.
+
+```{r}
+#| label: qc-metrics
+
+tg[["percent.mt"]] <- PercentageFeatureSet(
+  tg,
+  pattern = "^MT-"
+)
+
+tg[["percent.ribo"]] <- PercentageFeatureSet(
+  tg,
+  pattern = "^RP[SL]"
+)
+
+hb_genes <- intersect(
+  c("HBA1", "HBA2", "HBB", "HBD", "HBE1", "HBG1", "HBG2", "HBM", "HBQ1", "HBZ"),
+  rownames(tg)
+)
+
+if (length(hb_genes) > 0L) {
+  tg[["percent.hb"]] <- PercentageFeatureSet(
+    tg,
+    features = hb_genes
+  )
+} else {
+  tg$percent.hb <- 0
+}
+
+qc_metric_comparison <- FeatureScatter(
+  tg,
+  feature1 = "percent_mt_author",
+  feature2 = "percent.mt"
+) +
+  ggtitle("Author-supplied vs recalculated mitochondrial percentage")
+
+qc_metric_comparison
+```
+
+## QC distributions
+
+```{r}
+#| label: qc-distributions
+#| fig-width: 14
+#| fig-height: 5
+
+qc_by_donor <- VlnPlot(
+  tg,
+  features = c("nFeature_RNA", "nCount_RNA", "percent.mt", "percent.ribo"),
+  group.by = "donor",
+  pt.size = 0,
+  ncol = 4
+)
+
+qc_by_donor
+```
+
+```{r}
+#| label: qc-feature-count-relationship
+#| fig-width: 12
+#| fig-height: 5
+
+feature_count_scatter <- FeatureScatter(
+  tg,
+  feature1 = "nCount_RNA",
+  feature2 = "nFeature_RNA",
+  group.by = "cell_type_author"
+)
+
+count_mt_scatter <- FeatureScatter(
+  tg,
+  feature1 = "nCount_RNA",
+  feature2 = "percent.mt",
+  group.by = "cell_type_author"
+)
+
+feature_count_scatter + count_mt_scatter
+```
+
+## Conservative QC flags
+
+These are review flags only. Do not subset nuclei until their effects are
+assessed by donor and author-defined subtype.
+
+```{r}
+#| label: qc-flags
+
+qc_min_features <- 200L
+qc_min_counts <- 300L
+qc_max_mt <- 10
+
+tg$qc_low_features <- tg$nFeature_RNA < qc_min_features
+tg$qc_low_counts <- tg$nCount_RNA < qc_min_counts
+tg$qc_high_mt <- tg$percent.mt > qc_max_mt
+
+tg$qc_flag <- tg$qc_low_features |
+  tg$qc_low_counts |
+  tg$qc_high_mt
+
+tg$qc_status <- factor(
+  ifelse(tg$qc_flag, "flagged", "retain"),
+  levels = c("retain", "flagged")
+)
+```
+
+## Initial neuron subset
+
+This subset preserves all author-defined neuronal nuclei for the first
+neuron-focused QC and visualization pass. The original full TG object remains
+the source for later broad cell-class reference analyses.
+
+```{r}
+#| label: neuron-subset
+
+tg_neurons_raw <- subset(
+  tg,
+  subset = cell_type_author == "neuron"
+)
+
+neuron_subtype_manifest <- tg_neurons_raw[[]] |>
+  count(donor, subtype_author, name = "n_nuclei") |>
+  arrange(subtype_author, donor)
+
+knitr::kable(neuron_subtype_manifest)
+
+write.csv(
+  neuron_subtype_manifest,
+  "results/qc/GSE197289_neuron_donor_by_subtype_nuclei.csv",
+  row.names = FALSE
+)
+
+tg_neurons_raw
+```
+
+## Neuronal normalization and visualization
+
+This section uses SCTransform for neuron-focused visualization, PCA, UMAP, and
+exploratory clustering. The raw `RNA` counts in `tg_neurons_raw` remain the
+exclusive input for pseudobulk construction.
+
+```{r}
+#| label: neuron-sct-umap
+#| cache: true
+
+tg_neurons_sct <- SCTransform(
+  tg_neurons_raw,
+  assay = "RNA",
+  vst.flavor = "v2",
+  variable.features.n = 3000,
+  verbose = TRUE
+)
+
+tg_neurons_sct <- RunPCA(
+  tg_neurons_sct,
+  assay = "SCT",
+  npcs = 50,
+  verbose = FALSE
+)
+
+ElbowPlot(tg_neurons_sct, ndims = 50)
+```
+
+```{r}
+#| label: neuron-umap-cluster
+#| cache: true
+#| fig-width: 14
+#| fig-height: 10
+
+dims_use <- 1:30
+
+tg_neurons_sct <- FindNeighbors(
+  tg_neurons_sct,
+  reduction = "pca",
+  dims = dims_use,
+  verbose = FALSE
+)
+
+tg_neurons_sct <- FindClusters(
+  tg_neurons_sct,
+  resolution = 0.4,
+  cluster.name = "cluster_sct_r04",
+  verbose = FALSE
+)
+
+tg_neurons_sct <- RunUMAP(
+  tg_neurons_sct,
+  reduction = "pca",
+  dims = dims_use,
+  reduction.name = "umap_sct",
+  seed.use = 197289,
+  verbose = FALSE
+)
+
+
+p_donor <- DimPlot(
+  tg_neurons_sct,
+  reduction = "umap_sct",
+  group.by = "donor"
+) +
+  ggtitle("TG donor")
+
+
+p_subtype <- DimPlot(
+  tg_neurons_sct,
+  reduction = "umap_sct",
+  group.by = "subtype_author",
+  label = TRUE,
+  repel = TRUE
+) +
+  ggtitle("Author-defined human TG neuronal subtypes")
+
+p_cluster <- DimPlot(
+  tg_neurons_sct,
+  reduction = "umap_sct",
+  group.by = "cluster_sct_r04",
+  label = TRUE,
+  repel = TRUE
+) +
+  ggtitle("Exploratory Seurat clusters")
+
+p_donor
+
+p_subtype + p_cluster
+```
+
+```{r}
+#| label: subtype-cluster-concordance
+
+subtype_cluster_concordance <- tg_neurons_sct[[]] |>
+  count(subtype_author, cluster_sct_r04, name = "n_nuclei") |>
+  group_by(subtype_author) |>
+  mutate(
+    subtype_total = sum(n_nuclei),
+    fraction_within_subtype = n_nuclei / subtype_total
+  ) |>
+  ungroup() |>
+  arrange(subtype_author, desc(fraction_within_subtype))
+
+knitr::kable(subtype_cluster_concordance, digits = 3)
+
+write.csv(
+  subtype_cluster_concordance,
+  "results/qc/GSE197289_neuron_subtype_cluster_concordance.csv",
+  row.names = FALSE
+)
+```
+
+## Neuronal marker validation
+
+```{r}
+#| label: neuron-marker-plots
+#| cache: true
+#| fig-width: 14
+#| fig-height: 14
+
+marker_panel <- c(
+  "RBFOX3", "SNAP25", "SYT1", "ELAVL4", "TUBB3",
+  "NTRK1", "NTRK2", "NTRK3",
+  "TRPV1", "CALCA", "TAC1",
+  "P2RX3", "TRPM8", "SST"
+)
+
+marker_panel_present <- intersect(marker_panel, rownames(tg_neurons_sct))
+marker_panel_missing <- setdiff(marker_panel, marker_panel_present)
+
+message(
+  "Present markers: ", paste(marker_panel_present, collapse = ", "),
+  "\nMissing markers: ", paste(marker_panel_missing, collapse = ", ")
+)
+
+FeaturePlot(
+  tg_neurons_sct,
+  features = marker_panel_present,
+  reduction = "umap_sct",
+  min.cutoff = "q05",
+  max.cutoff = "q95",
+  ncol = 4
+)
+```
+```{r}
+#| label: marker-violin-plots
+#| fig-width: 14
+#| fig-height: 8
+
+violin_marker_panel <- c(
+  "NTRK1", "NTRK2", "NTRK3",
+  "TRPV1", "CALCA", "TAC1",
+  "MRGPRD", "P2RX3", "TRPM8", "SST"
+)
+
+violin_marker_present <- intersect(
+  violin_marker_panel,
+  rownames(tg_neurons_sct)
+)
+
+violin_marker_missing <- setdiff(
+  violin_marker_panel,
+  violin_marker_present
+)
+
+message(
+  "Markers omitted because absent from matrix: ",
+  paste(violin_marker_missing, collapse = ", ")
+)
+
+VlnPlot(
+  tg_neurons_sct,
+  features = violin_marker_present,
+  group.by = "subtype_author",
+  pt.size = 0,
+  ncol = 5
+)
+```
+
+
+## Donor-by-subtype raw-count pseudobulk
+
+Pseudobulk profiles are sums of raw UMI counts across nuclei grouped by biological
+donor and author-defined neuronal subtype. Only groups with at least 20 nuclei
+are retained for bulk-RNA comparison.
+
+```{r}
+#| label: neuronal-pseudobulk-manifest
+
+minimum_nuclei_per_group <- 20L
+
+pb_manifest <- tg_neurons_raw[[]] |>
+  transmute(
+    donor = as.character(donor),
+    subtype_author = as.character(subtype_author)
+  ) |>
+  count(donor, subtype_author, name = "n_nuclei") |>
+  mutate(
+    include_pseudobulk = n_nuclei >= minimum_nuclei_per_group,
+    exclusion_reason = if_else(
+      include_pseudobulk,
+      NA_character_,
+      paste0("< ", minimum_nuclei_per_group, " nuclei")
+    ),
+    pseudobulk_id = paste(donor, subtype_author, sep = "__")
+  ) |>
+  arrange(subtype_author, donor)
+
+knitr::kable(pb_manifest)
+
+write.csv(
+  pb_manifest,
+  "results/pseudobulk/GSE197289_neuronal_pseudobulk_manifest.csv",
+  row.names = FALSE
+)
+
+```
+
+```{r}
+#| label: construct-raw-pseudobulk
+#| cache: true
+
+# Raw counts are retrieved explicitly from the unmodified RNA assay.
+raw_counts <- GetAssayData(
+  tg_neurons_raw,
+  assay = "RNA",
+  layer = "counts"
+)
+
+# Establish a cell-level grouping table in the exact matrix-column order.
+cell_metadata <- tg_neurons_raw[[]] |>
+  as.data.frame() |>
+  mutate(
+    barcode = rownames(tg_neurons_raw[[]]),
+    donor = as.character(donor),
+    subtype_author = as.character(subtype_author),
+    pseudobulk_id = paste(donor, subtype_author, sep = "__")
+  )
+
+stopifnot(identical(cell_metadata$barcode, colnames(raw_counts)))
+stopifnot(nrow(cell_metadata) == ncol(raw_counts))
+
+# Keep only donor x subtype groups meeting the predeclared cell-count criterion.
+pb_sample_metadata <- pb_manifest |>
+  filter(include_pseudobulk) |>
+  mutate(
+    donor = as.character(donor),
+    subtype_author = as.character(subtype_author),
+    pseudobulk_id = as.character(pseudobulk_id)
+  ) |>
+  arrange(subtype_author, donor)
+
+group_levels <- pb_sample_metadata$pseudobulk_id
+
+# Map every nucleus to its retained pseudobulk group.
+cell_group <- cell_metadata$pseudobulk_id
+keep_cell <- cell_group %in% group_levels
+
+message(
+  "Nuclei retained for pseudobulk: ", sum(keep_cell), " / ", length(keep_cell),
+  "\nPseudobulk groups retained: ", length(group_levels)
+)
+
+# Avoid a barcode-based two-dimensional matrix subset:
+# use logical selection, which remains in exact count-matrix order.
+raw_counts_keep <- raw_counts[, keep_cell]
+
+cell_group_keep <- factor(
+  cell_group[keep_cell],
+  levels = group_levels
+)
+
+# Sparse cells x pseudobulk membership matrix.
+membership <- Matrix::sparse.model.matrix(~ 0 + cell_group_keep)
+
+# Matrix columns must follow pseudobulk metadata order.
+colnames(membership) <- group_levels
+
+stopifnot(nrow(membership) == ncol(raw_counts_keep))
+stopifnot(identical(colnames(raw_counts_keep), cell_metadata$barcode[keep_cell]))
+
+# genes x cells multiplied by cells x groups -> genes x pseudobulk samples.
+pb_counts <- raw_counts_keep %*% membership
+
+stopifnot(ncol(pb_counts) == nrow(pb_sample_metadata))
+stopifnot(identical(colnames(pb_counts), pb_sample_metadata$pseudobulk_id))
+stopifnot(all(pb_counts@x == floor(pb_counts@x)))
+
+pb_library_sizes <- tibble(
+  pseudobulk_id = colnames(pb_counts),
+  total_umis = Matrix::colSums(pb_counts),
+  detected_genes = Matrix::colSums(pb_counts > 0)
+) |>
+  left_join(pb_sample_metadata, by = "pseudobulk_id")
+
+pb_library_sizes <- pb_library_sizes |>
+  mutate(
+    confidence_tier = case_when(
+      n_nuclei >= 50 ~ "primary",
+      n_nuclei >= 20 ~ "exploratory",
+      TRUE ~ "excluded"
+    ),
+    confidence_tier = factor(
+      confidence_tier,
+      levels = c("primary", "exploratory", "excluded")
+    ),
+    mean_umis_per_nucleus = total_umis / n_nuclei,
+    genes_per_1000_umis = 1000 * detected_genes / total_umis
+  )
+
+knitr::kable(
+  pb_library_sizes |>
+    arrange(confidence_tier, subtype_author, donor),
+  digits = 2
+)
+saveRDS(
+  pb_counts,
+  "results/pseudobulk/GSE197289_TG_neuron_donor_subtype_raw_counts.rds"
+)
+
+write.csv(
+  pb_sample_metadata,
+  "results/pseudobulk/GSE197289_TG_neuron_donor_subtype_metadata.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  pb_library_sizes,
+  "results/pseudobulk/GSE197289_TG_neuron_donor_subtype_library_sizes.csv",
+  row.names = FALSE
+)
+
+tibble(
+  metric = c(
+    "Genes",
+    "Eligible donor-by-subtype pseudobulks",
+    "Nuclei represented",
+    "Nuclei excluded by minimum-group rule"
+  ),
+  value = c(
+    nrow(pb_counts),
+    ncol(pb_counts),
+    sum(keep_cell),
+    sum(!keep_cell)
+  )
+) |>
+  knitr::kable()
+```
+
+## Pseudobulk normalization and reference PCA
+
+```{r}
+#| label: pseudobulk-edger
+#| cache: true
+
+pb_dge <- DGEList(
+  counts = pb_counts,
+  samples = as.data.frame(pb_sample_metadata)
+)
+
+# For descriptive reference comparisons, retain genes expressed in at least
+# two pseudobulk samples. Do not use subtype as the filter group because some
+# subtype groups have only two donor-level profiles.
+keep_genes <- rowSums(cpm(pb_dge) >= 1) >= 2
+
+pb_dge <- pb_dge[keep_genes, , keep.lib.sizes = FALSE]
+pb_dge <- calcNormFactors(pb_dge, method = "TMM")
+
+pb_logcpm <- cpm(
+  pb_dge,
+  log = TRUE,
+  prior.count = 2
+)
+
+stopifnot(identical(colnames(pb_logcpm), pb_sample_metadata$pseudobulk_id))
+
+saveRDS(
+  pb_dge,
+  "results/pseudobulk/GSE197289_TG_neuron_donor_subtype_edgeR_dge.rds"
+)
+
+write.csv(
+  pb_logcpm,
+  "results/pseudobulk/GSE197289_TG_neuron_donor_subtype_logCPM.csv",
+  row.names = TRUE
+)
+
+tibble(
+  metric = c(
+    "Pseudobulk samples",
+    "Genes before expression filter",
+    "Genes retained",
+    "Median raw library size"
+  ),
+  value = c(
+    ncol(pb_counts),
+    nrow(pb_counts),
+    nrow(pb_dge),
+    median(pb_dge$samples$lib.size)
+  )
+) |>
+  knitr::kable()
+```
+
+## Neuronal subtype marker heatmap
+
+This heatmap displays TMM-normalized pseudobulk expression for curated neuronal
+and sensory-subtype markers. Values are gene-wise z-scores of log-CPM, so each
+row emphasizes relative expression across donor-by-subtype pseudobulks.
+
+```{r}
+#| label: pseudobulk-marker-heatmap
+#| fig-width: 13
+#| fig-height: 12
+
+marker_sets <- list(
+  `Pan-neuronal` = c(
+    "RBFOX3", "STMN2", "TUBB3", "ELAVL4",
+    "SNAP25", "SYT1", "UCHL1", "PRPH"
+  ),
+  `Peptidergic / nociceptor` = c(
+    "NTRK1", "TRPV1", "CALCA", "CALCB", "TAC1",
+    "SCN9A", "SCN10A", "SCN11A", "ASIC3", "PIRT",
+    "PRDM12", "POU4F1", "TLX3"
+  ),
+  `Non-peptidergic` = c(
+    "P2RX3", "RET", "GFRA3", "MRGPRX1",
+    "TAFA3", "IL17B", "PTGDR"
+  ),
+  `Neurofilament / mechanosensory` = c(
+    "NEFH", "NEFM", "NEFL", "NTRK2", "NTRK3",
+    "PIEZO2", "KCNS1", "KCNH6", "KCNIP3"
+  ),
+  `Cold / pruriceptor-associated` = c(
+    "TRPM8", "SST", "NMB", "HTR3A", "SLC17A6"
+  )
+)
+
+marker_table <- tibble(
+  gene = unlist(marker_sets, use.names = FALSE),
+  marker_group = rep(
+    names(marker_sets),
+    lengths(marker_sets)
+  )
+) |>
+  distinct(gene, .keep_all = TRUE)
+
+marker_table <- marker_table |>
+  mutate(
+    gene = toupper(gene),
+    present = gene %in% rownames(pb_logcpm)
+  )
+
+marker_missing <- marker_table |>
+  filter(!present)
+
+marker_present <- marker_table |>
+  filter(present)
+
+message(
+  "Markers retained: ", nrow(marker_present),
+  " / ", nrow(marker_table),
+  "\nAbsent markers: ",
+  paste(marker_missing$gene, collapse = ", ")
+)
+
+marker_matrix <- pb_logcpm[
+  marker_present$gene,
+  pb_sample_metadata$pseudobulk_id,
+  drop = FALSE
+]
+
+# Gene-wise z-score: display relative enrichment across pseudobulk profiles.
+marker_matrix_z <- t(scale(t(marker_matrix)))
+
+# Remove rows that cannot be scaled because expression is invariant.
+marker_matrix_z <- marker_matrix_z[
+  apply(marker_matrix_z, 1, function(x) all(is.finite(x))),
+  ,
+  drop = FALSE
+]
+
+marker_annotation <- pb_sample_metadata |>
+  select(pseudobulk_id, donor, subtype_author, n_nuclei) |>
+  as.data.frame()
+
+rownames(marker_annotation) <- marker_annotation$pseudobulk_id
+marker_annotation$pseudobulk_id <- NULL
+
+marker_row_annotation <- marker_present |>
+  filter(gene %in% rownames(marker_matrix_z)) |>
+  select(gene, marker_group) |>
+  as.data.frame()
+
+rownames(marker_row_annotation) <- marker_row_annotation$gene
+marker_row_annotation$gene <- NULL
+
+pheatmap(
+  marker_matrix_z,
+  cluster_rows = FALSE,
+  cluster_cols = TRUE,
+  annotation_col = marker_annotation,
+  annotation_row = marker_row_annotation,
+  gaps_row = cumsum(
+    table(marker_row_annotation$marker_group)
+  )[-length(unique(marker_row_annotation$marker_group))],
+  show_colnames = TRUE,
+  show_rownames = TRUE,
+  fontsize_row = 9,
+  fontsize_col = 8,
+  border_color = NA,
+  main = "Human TG neuronal pseudobulk marker expression"
+)
+
+write.csv(
+  marker_table,
+  "results/pseudobulk/GSE197289_TG_marker_heatmap_gene_manifest.csv",
+  row.names = FALSE
+)
+```
+
+
+## Broad TG cell-type pseudobulk reference
+
+This reference aggregates nuclei by donor and broad author-defined TG cell type.
+It is intended for transcriptional purity assessment of bulk RNA-seq samples;
+it is not a literal cell-fraction deconvolution model.
+
+```{r}
+#| label: define-tg-broad-cell-types
+
+tg$tg_broad_type <- dplyr::case_when(
+  tg$subtype_author %in% c(
+    "NF1", "NF2", "NF3", "PEP",
+    "NP", "SST", "TRPM8", "cLTMR"
+  ) ~ "Neuron",
+
+  tg$subtype_author == "Satglia" ~ "Satellite glia",
+
+  tg$subtype_author %in% c(
+    "Schwann M", "Schwann N"
+  ) ~ "Schwann cell",
+
+  tg$subtype_author %in% c(
+    "Fibroblast Mgpt", "Fibroblast Dcnt", "Fibroblast Apod"
+  ) ~ "Fibroblast",
+
+  tg$subtype_author == "Vascular" ~ "Vascular",
+
+  tg$subtype_author == "Immune" ~ "Immune",
+
+  TRUE ~ "Other"
+)
+
+tg$tg_broad_type <- factor(
+  tg$tg_broad_type,
+  levels = c(
+    "Neuron",
+    "Satellite glia",
+    "Schwann cell",
+    "Fibroblast",
+    "Vascular",
+    "Immune",
+    "Other"
+  )
+)
+
+tg_broad_manifest <- tg[[]] |>
+  as.data.frame() |>
+  mutate(donor = as.character(donor)) |>
+  count(donor, tg_broad_type, name = "n_nuclei") |>
+  mutate(
+    pseudobulk_id = paste(donor, tg_broad_type, sep = "__"),
+    include_pseudobulk = n_nuclei >= 20L
+  ) |>
+  arrange(tg_broad_type, donor)
+
+knitr::kable(tg_broad_manifest)
+
+write.csv(
+  tg_broad_manifest,
+  "results/pseudobulk/GSE197289_TG_broad_type_manifest.csv",
+  row.names = FALSE
+)
+```
+
+```{r}
+#| label: construct-tg-broad-pseudobulk
+#| cache: true
+
+tg_raw_counts <- GetAssayData(
+  tg,
+  assay = "RNA",
+  layer = "counts"
+)
+
+tg_cell_metadata <- tg[[]] |>
+  as.data.frame() |>
+  mutate(
+    barcode = rownames(tg[[]]),
+    donor = as.character(donor),
+    tg_broad_type = as.character(tg_broad_type),
+    pseudobulk_id = paste(donor, tg_broad_type, sep = "__")
+  )
+
+stopifnot(identical(tg_cell_metadata$barcode, colnames(tg_raw_counts)))
+
+tg_pb_metadata <- tg_broad_manifest |>
+  filter(include_pseudobulk) |>
+  mutate(
+    donor = as.character(donor),
+    tg_broad_type = as.character(tg_broad_type)
+  ) |>
+  arrange(tg_broad_type, donor)
+
+tg_pb_ids <- tg_pb_metadata$pseudobulk_id
+tg_cell_group <- tg_cell_metadata$pseudobulk_id
+tg_keep_cell <- tg_cell_group %in% tg_pb_ids
+
+tg_membership <- Matrix::sparse.model.matrix(
+  ~ 0 + factor(
+    tg_cell_group[tg_keep_cell],
+    levels = tg_pb_ids
+  )
+)
+
+colnames(tg_membership) <- tg_pb_ids
+
+tg_broad_pb_counts <- tg_raw_counts[, tg_keep_cell, drop = FALSE] %*%
+  tg_membership
+
+stopifnot(identical(
+  colnames(tg_broad_pb_counts),
+  tg_pb_metadata$pseudobulk_id
+))
+stopifnot(all(tg_broad_pb_counts@x == floor(tg_broad_pb_counts@x)))
+
+tg_broad_pb_qc <- tibble(
+  pseudobulk_id = colnames(tg_broad_pb_counts),
+  total_umis = Matrix::colSums(tg_broad_pb_counts),
+  detected_genes = Matrix::colSums(tg_broad_pb_counts > 0)
+) |>
+  left_join(tg_pb_metadata, by = "pseudobulk_id") |>
+  mutate(
+    mean_umis_per_nucleus = total_umis / n_nuclei
+  )
+
+knitr::kable(tg_broad_pb_qc, digits = 2)
+
+saveRDS(
+  tg_broad_pb_counts,
+  "results/pseudobulk/GSE197289_TG_broad_type_donor_raw_counts.rds"
+)
+
+write.csv(
+  tg_broad_pb_qc,
+  "results/pseudobulk/GSE197289_TG_broad_type_donor_metadata.csv",
+  row.names = FALSE
+)
+```
+
+```{r}
+#| label: normalize-tg-broad-pseudobulk
+#| cache: true
+
+tg_broad_dge <- edgeR::DGEList(
+  counts = tg_broad_pb_counts,
+  samples = as.data.frame(tg_pb_metadata)
+)
+
+tg_broad_keep_genes <- rowSums(
+  edgeR::cpm(tg_broad_dge) >= 1
+) >= 2L
+
+tg_broad_dge <- tg_broad_dge[
+  tg_broad_keep_genes,
+  ,
+  keep.lib.sizes = FALSE
+]
+
+tg_broad_dge <- edgeR::calcNormFactors(
+  tg_broad_dge,
+  method = "TMM"
+)
+
+tg_broad_logcpm <- edgeR::cpm(
+  tg_broad_dge,
+  log = TRUE,
+  prior.count = 2
+)
+
+write.csv(
+  tg_broad_logcpm,
+  "results/pseudobulk/GSE197289_TG_broad_type_donor_logCPM.csv",
+  row.names = TRUE
+)
+
+saveRDS(
+  tg_broad_dge,
+  "results/pseudobulk/GSE197289_TG_broad_type_donor_edgeR_dge.rds"
+)
+```
+
+## Broad TG marker programs
+
+```{r}
+#| label: tg-broad-purity-marker-heatmap
+#| fig-width: 14
+#| fig-height: 11
+
+purity_markers <- list(
+  `Pan-neuronal` = c(
+    "RBFOX3", "SNAP25", "SYT1", "STMN2",
+    "ELAVL4", "TUBB3", "UCHL1", "PRPH"
+  ),
+  `Sensory neuron` = c(
+    "NTRK1", "NTRK2", "NTRK3", "SCN9A",
+    "SCN10A", "P2RX3", "TRPV1", "CALCA"
+  ),
+  `Satellite glia` = c(
+    "S100B", "SLC1A3", "GLUL", "KCNJ10",
+    "FABP7", "PLP1", "SLC1A2"
+  ),
+  `Schwann cell` = c(
+    "SOX10", "MPZ", "MBP", "PMP22",
+    "MAG", "NGFR", "NCAM1"
+  ),
+  `Fibroblast` = c(
+    "COL1A1", "COL1A2", "COL3A1", "DCN",
+    "LUM", "COL6A1", "COL6A2", "PDGFRA"
+  ),
+  `Vascular` = c(
+    "VWF", "KDR", "EMCN", "PECAM1",
+    "RAMP2", "PLVAP", "CLDN5"
+  ),
+  `Immune` = c(
+    "PTPRC", "TYROBP", "LST1", "AIF1",
+    "C1QA", "C1QB", "C1QC", "HLA-DRA"
+  )
+)
+
+purity_marker_table <- tibble(
+  gene = unlist(purity_markers, use.names = FALSE),
+  marker_group = rep(names(purity_markers), lengths(purity_markers))
+) |>
+  mutate(gene = toupper(gene)) |>
+  distinct(gene, .keep_all = TRUE) |>
+  filter(gene %in% rownames(tg_broad_logcpm))
+
+purity_matrix <- tg_broad_logcpm[
+  purity_marker_table$gene,
+  tg_pb_metadata$pseudobulk_id,
+  drop = FALSE
+]
+
+purity_matrix_z <- t(scale(t(purity_matrix)))
+
+purity_matrix_z <- purity_matrix_z[
+  apply(purity_matrix_z, 1, function(x) all(is.finite(x))),
+  ,
+  drop = FALSE
+]
+
+purity_col_annotation <- tg_pb_metadata |>
+  select(pseudobulk_id, donor, tg_broad_type, n_nuclei) |>
+  as.data.frame()
+
+rownames(purity_col_annotation) <- purity_col_annotation$pseudobulk_id
+purity_col_annotation$pseudobulk_id <- NULL
+
+purity_row_annotation <- purity_marker_table |>
+  filter(gene %in% rownames(purity_matrix_z)) |>
+  select(gene, marker_group) |>
+  as.data.frame()
+
+rownames(purity_row_annotation) <- purity_row_annotation$gene
+purity_row_annotation$gene <- NULL
+
+pheatmap::pheatmap(
+  purity_matrix_z,
+  cluster_rows = FALSE,
+  cluster_cols = TRUE,
+  annotation_col = purity_col_annotation,
+  annotation_row = purity_row_annotation,
+  show_colnames = TRUE,
+  show_rownames = TRUE,
+  fontsize_row = 9,
+  fontsize_col = 8,
+  border_color = NA,
+  main = "Human TG broad cell-type pseudobulk marker programs"
+)
+
+write.csv(
+  purity_marker_table,
+  "results/pseudobulk/GSE197289_TG_broad_purity_marker_manifest.csv",
+  row.names = FALSE
+)
+```
+## Combined pseudobulk reference
+
+This integrated reference combines donor-by-neuronal-subtype pseudobulks with
+donor-by-broad non-neuronal TG pseudobulks. One shared TMM normalization produces
+a common expression scale for the integrated PCA and marker heatmap.
+
+```{r}
+#| label: build-combined-pseudobulk-reference
+#| cache: false
+
+stopifnot(identical(
+  rownames(pb_counts),
+  rownames(tg_broad_pb_counts)
+))
+
+stopifnot(!anyDuplicated(colnames(pb_counts)))
+stopifnot(!anyDuplicated(colnames(tg_broad_pb_counts)))
+
+# Exclude donor-level neuronal pseudobulks because donor-by-neuronal-subtype
+# profiles provide the higher-resolution neuronal reference.
+tg_non_neuronal_ids <- tg_pb_metadata |>
+  filter(tg_broad_type != "Neuron") |>
+  pull(pseudobulk_id)
+
+combined_counts <- cbind(
+  pb_counts,
+  tg_broad_pb_counts[, tg_non_neuronal_ids, drop = FALSE]
+)
+
+combined_metadata_neuron <- pb_library_sizes |>
+  transmute(
+    pseudobulk_id,
+    donor = as.character(donor),
+    reference_level = "Neuronal subtype",
+    reference_label = as.character(subtype_author),
+    n_nuclei,
+    total_umis,
+    detected_genes
+  )
+
+combined_metadata_non_neuron <- tg_broad_pb_qc |>
+  filter(pseudobulk_id %in% tg_non_neuronal_ids) |>
+  transmute(
+    pseudobulk_id,
+    donor = as.character(donor),
+    reference_level = "Broad non-neuronal",
+    reference_label = as.character(tg_broad_type),
+    n_nuclei,
+    total_umis,
+    detected_genes
+  )
+
+combined_metadata <- bind_rows(
+  combined_metadata_neuron,
+  combined_metadata_non_neuron
+) |>
+  mutate(
+    reference_level = factor(
+      reference_level,
+      levels = c("Neuronal subtype", "Broad non-neuronal")
+    ),
+    reference_label = factor(reference_label)
+  )
+
+combined_metadata <- combined_metadata[
+  match(colnames(combined_counts), combined_metadata$pseudobulk_id),
+  ,
+  drop = FALSE
+]
+
+stopifnot(identical(
+  combined_metadata$pseudobulk_id,
+  colnames(combined_counts)
+))
+
+stopifnot(!anyDuplicated(combined_metadata$pseudobulk_id))
+stopifnot(all(combined_counts@x == floor(combined_counts@x)))
+
+combined_dge <- edgeR::DGEList(
+  counts = combined_counts,
+  samples = as.data.frame(combined_metadata)
+)
+
+combined_keep_genes <- rowSums(
+  edgeR::cpm(combined_dge) >= 1
+) >= 2L
+
+combined_dge <- combined_dge[
+  combined_keep_genes,
+  ,
+  keep.lib.sizes = FALSE
+]
+
+combined_dge <- edgeR::calcNormFactors(
+  combined_dge,
+  method = "TMM"
+)
+
+combined_logcpm <- edgeR::cpm(
+  combined_dge,
+  log = TRUE,
+  prior.count = 2
+)
+
+combined_metadata <- combined_metadata |>
+  mutate(
+    mean_umis_per_nucleus = total_umis / n_nuclei
+  )
+
+stopifnot(identical(
+  colnames(combined_logcpm),
+  combined_metadata$pseudobulk_id
+))
+
+combined_reference_summary <- tibble(
+  metric = c(
+    "Combined pseudobulk profiles",
+    "Neuronal subtype profiles",
+    "Broad non-neuronal profiles",
+    "Genes before expression filter",
+    "Genes retained"
+  ),
+  value = c(
+    ncol(combined_counts),
+    sum(combined_metadata$reference_level == "Neuronal subtype"),
+    sum(combined_metadata$reference_level == "Broad non-neuronal"),
+    nrow(combined_counts),
+    nrow(combined_dge)
+  )
+)
+
+knitr::kable(combined_reference_summary)
+
+saveRDS(
+  combined_dge,
+  "results/pseudobulk/GSE197289_TG_combined_reference_edgeR_dge.rds"
+)
+
+write.csv(
+  combined_metadata,
+  "results/pseudobulk/GSE197289_TG_combined_reference_metadata.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  combined_logcpm,
+  "results/pseudobulk/GSE197289_TG_combined_reference_logCPM.csv",
+  row.names = TRUE
+)
+```
+
+
+
+```{r}
+#| label: combined-pseudobulk-pca
+#| fig-width: 11
+#| fig-height: 8
+
+combined_pca <- prcomp(
+  t(combined_logcpm),
+  center = TRUE,
+  scale. = FALSE
+)
+
+combined_pca_var <- 100 * summary(combined_pca)$importance[2, 1:2]
+
+combined_pca_df <- combined_metadata |>
+  mutate(
+    PC1 = combined_pca$x[pseudobulk_id, 1],
+    PC2 = combined_pca$x[pseudobulk_id, 2]
+  )
+
+stopifnot(
+  !anyNA(combined_pca_df$PC1),
+  !anyNA(combined_pca_df$PC2)
+)
+
+ggplot(
+  combined_pca_df,
+  aes(
+    x = PC1,
+    y = PC2,
+    color = reference_label,
+    shape = reference_level,
+    size = n_nuclei
+  )
+) +
+  geom_point(alpha = 0.9) +
+  ggrepel::geom_text_repel(
+    aes(label = pseudobulk_id),
+    size = 3,
+    max.overlaps = Inf,
+    show.legend = FALSE
+  ) +
+  scale_size_continuous(range = c(3, 9)) +
+  labs(
+    title = "Integrated human TG pseudobulk reference",
+    subtitle = "Neuronal subtypes and broad non-neuronal TG cell classes",
+    x = sprintf("PC1 (%.1f%%)", combined_pca_var[1]),
+    y = sprintf("PC2 (%.1f%%)", combined_pca_var[2]),
+    color = "Reference identity",
+    shape = "Reference level",
+    size = "Nuclei aggregated"
+  ) +
+  theme_classic()
+```
+
+## Integrated marker heatmap
+
+```{r}
+#| label: combined-pseudobulk-marker-heatmap
+#| fig-width: 15
+#| fig-height: 15
+
+combined_marker_sets <- list(
+  `Pan-neuronal` = c(
+    "RBFOX3", "SNAP25", "SYT1", "STMN2",
+    "ELAVL4", "TUBB3", "UCHL1", "PRPH"
+  ),
+  `Peptidergic nociceptor` = c(
+    "NTRK1", "TRPV1", "CALCA", "CALCB",
+    "TAC1", "SCN9A", "SCN10A", "SCN11A",
+    "ASIC3", "PIRT", "PRDM12", "POU4F1", "TLX3"
+  ),
+  `Non-peptidergic nociceptor` = c(
+    "P2RX3", "RET", "GFRA3", "MRGPRX1",
+    "TAFA3", "IL17B", "PTGDR"
+  ),
+  `Neurofilament / mechanosensory` = c(
+    "NEFH", "NEFM", "NEFL", "NTRK2",
+    "NTRK3", "PIEZO2", "KCNS1", "KCNH6", "KCNIP3"
+  ),
+  `Cold / pruriceptor-associated` = c(
+    "TRPM8", "SST", "NMB", "HTR3A", "SLC17A6"
+  ),
+  `Satellite glia` = c(
+    "S100B", "SLC1A3", "GLUL", "KCNJ10",
+    "FABP7", "PLP1", "SLC1A2"
+  ),
+  `Schwann cell` = c(
+    "SOX10", "MPZ", "MBP", "PMP22",
+    "MAG", "NGFR", "NCAM1"
+  ),
+  `Fibroblast` = c(
+    "COL1A1", "COL1A2", "COL3A1", "DCN",
+    "LUM", "COL6A1", "COL6A2", "PDGFRA"
+  ),
+  `Vascular` = c(
+    "VWF", "KDR", "EMCN", "PECAM1",
+    "RAMP2", "PLVAP", "CLDN5"
+  ),
+  `Immune` = c(
+    "PTPRC", "TYROBP", "LST1", "AIF1",
+    "C1QA", "C1QB", "C1QC", "HLA-DRA"
+  )
+)
+
+combined_marker_manifest <- tibble(
+  gene = unlist(combined_marker_sets, use.names = FALSE),
+  marker_group = rep(
+    names(combined_marker_sets),
+    lengths(combined_marker_sets)
+  )
+) |>
+  mutate(gene = toupper(gene)) |>
+  distinct(gene, .keep_all = TRUE) |>
+  mutate(present = gene %in% rownames(combined_logcpm))
+
+combined_marker_missing <- combined_marker_manifest |>
+  filter(!present)
+
+combined_marker_manifest <- combined_marker_manifest |>
+  filter(present)
+
+message(
+  "Markers retained: ", nrow(combined_marker_manifest),
+  "\nAbsent markers: ",
+  paste(combined_marker_missing$gene, collapse = ", ")
+)
+
+combined_marker_matrix <- combined_logcpm[
+  combined_marker_manifest$gene,
+  combined_metadata$pseudobulk_id,
+  drop = FALSE
+]
+
+combined_marker_matrix_z <- t(scale(t(combined_marker_matrix)))
+
+combined_marker_matrix_z <- combined_marker_matrix_z[
+  apply(combined_marker_matrix_z, 1, function(x) all(is.finite(x))),
+  ,
+  drop = FALSE
+]
+
+combined_col_annotation <- combined_metadata |>
+  select(
+    pseudobulk_id,
+    donor,
+    reference_level,
+    reference_label,
+    n_nuclei
+  ) |>
+  as.data.frame()
+
+rownames(combined_col_annotation) <- combined_col_annotation$pseudobulk_id
+combined_col_annotation$pseudobulk_id <- NULL
+
+combined_row_annotation <- combined_marker_manifest |>
+  filter(gene %in% rownames(combined_marker_matrix_z)) |>
+  select(gene, marker_group) |>
+  as.data.frame()
+
+rownames(combined_row_annotation) <- combined_row_annotation$gene
+combined_row_annotation$gene <- NULL
+
+pheatmap::pheatmap(
+  combined_marker_matrix_z,
+  cluster_rows = FALSE,
+  cluster_cols = TRUE,
+  annotation_col = combined_col_annotation,
+  annotation_row = combined_row_annotation,
+  show_colnames = TRUE,
+  show_rownames = TRUE,
+  fontsize_row = 8,
+  fontsize_col = 7,
+  border_color = NA,
+  main = "Integrated human TG pseudobulk marker programs"
+)
+
+write.csv(
+  combined_marker_manifest,
+  "results/pseudobulk/GSE197289_TG_combined_marker_manifest.csv",
+  row.names = FALSE
+)
+```
+
+## Save final objects
+
+```{r}
+#| label: save-final-objects
+
+saveRDS(
+  tg,
+  "results/seurat/GSE197289_human_TG_full_raw.rds"
+)
+
+saveRDS(
+  tg_neurons_raw,
+  "results/seurat/GSE197289_human_TG_neurons_raw.rds"
+)
+
+saveRDS(
+  tg_neurons_sct,
+  "results/seurat/GSE197289_human_TG_neurons_sct.rds"
+)
+
+final_outputs <- tibble(
+  artifact = c(
+    "Full TG Seurat object",
+    "Raw neuronal Seurat object",
+    "SCT neuronal Seurat object",
+    "Neuronal pseudobulk raw counts",
+    "Integrated TG pseudobulk edgeR object",
+    "Integrated TG pseudobulk log-CPM"
+  ),
+  path = c(
+    "results/seurat/GSE197289_human_TG_full_raw.rds",
+    "results/seurat/GSE197289_human_TG_neurons_raw.rds",
+    "results/seurat/GSE197289_human_TG_neurons_sct.rds",
+    "results/pseudobulk/GSE197289_TG_neuron_donor_subtype_raw_counts.rds",
+    "results/pseudobulk/GSE197289_TG_combined_reference_edgeR_dge.rds",
+    "results/pseudobulk/GSE197289_TG_combined_reference_logCPM.csv"
+  )
+)
+
+knitr::kable(final_outputs)
+```

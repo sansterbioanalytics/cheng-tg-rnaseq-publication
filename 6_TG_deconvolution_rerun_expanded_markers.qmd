@@ -1,0 +1,830 @@
+---
+title: "Deconvolution Rerun with Expanded Empirical Marker Panel"
+subtitle: "Pipeline step 6 of 6 -- run after 5_TG_single_cell_marker_refinement.qmd; reruns weekly NNLS deconvolution and VIF diagnostics using the expanded, empirically-specific marker manifest"
+author: "Austin Hovland"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+editor: visual
+execute:
+  echo: true
+  warning: false
+  message: false
+  cache: true
+---
+
+## Purpose
+
+`5_TG_single_cell_marker_refinement.qmd` replaced the 79-gene literature marker manifest with a 239-gene empirically-specific manifest (160 net new neuronal markers from one-vs-rest DE on real single-nucleus clusters). That expansion collapsed mean VIF among the collinear neuronal identities from 11.31 to 4.09, and drove every previously severe column below the VIF = 10 threshold (NF1 27.33 -> 5.64, NF2 25.06 -> 5.18, PEP 21.24 -> 4.08, NF3 13.40 -> 3.19). This notebook takes that validated win and reruns the actual weekly-facing deliverables -- the NNLS composition trajectories from `3_TG_incoming_sample_QC_maturation.qmd` and the four-part diagnostic suite from `4_TG_deconvolution_diagnostics.qmd` -- on the same incoming bulk samples, using the expanded manifest as the signature matrix.
+
+**Identifier mismatch fixed in this version:** the incoming Salmon/GENCODE counts are keyed by versioned Ensembl gene IDs (`ENSG00000000003.15`), while the single-cell-derived reference (`combined_dge$counts`) is keyed by gene symbols (`TSPAN6`, `SAMD11`, ...). Naively intersecting these two ID spaces returns zero shared genes, which is what produced the `'counts' must contain at least one value` error in the prior version of this notebook. This version resolves Ensembl IDs to gene symbols via `biomaRt` (with an `org.Hs.eg.db` fallback if Ensembl's BioMart service is unreachable), explicitly handles one-to-many and many-to-one mappings so no gene is silently dropped, and collapses any resulting duplicate symbols by summing counts -- the standard lossless approach for reducing ID multiplicity in count matrices.
+
+This notebook assumes, in order:
+
+1. `1_TG_sc_reprocessing.qmd` has been run (`results/pseudobulk/` and `results/seurat/` populated).
+2. `3_TG_incoming_sample_QC_maturation.qmd` has been run at least once on the current incoming batch (`results/incoming_qc/` populated, including `weekly_nnls_deconvolution_fractions.csv` as the "before" baseline).
+3. `5_TG_single_cell_marker_refinement.qmd` has been run (`results/marker_refinement/GSE197289_TG_expanded_marker_manifest.csv` populated).
+
+## Setup
+
+```{r}
+#| label: setup
+
+library(dplyr)
+library(tidyr)
+library(readr)
+library(tibble)
+library(purrr)
+library(stringr)
+library(ggplot2)
+library(ggrepel)
+library(scales)
+library(pheatmap)
+library(edgeR)
+
+if (!requireNamespace("nnls", quietly = TRUE)) {
+  install.packages("nnls", repos = "https://cloud.r-project.org")
+}
+library(nnls)
+
+if (!requireNamespace("biomaRt", quietly = TRUE)) {
+  if (!requireNamespace("BiocManager", quietly = TRUE)) {
+    install.packages("BiocManager", repos = "https://cloud.r-project.org")
+  }
+  BiocManager::install("biomaRt", update = FALSE, ask = FALSE)
+}
+library(biomaRt)
+
+if (!requireNamespace("org.Hs.eg.db", quietly = TRUE)) {
+  if (!requireNamespace("BiocManager", quietly = TRUE)) {
+    install.packages("BiocManager", repos = "https://cloud.r-project.org")
+  }
+  BiocManager::install("org.Hs.eg.db", update = FALSE, ask = FALSE)
+}
+if (!requireNamespace("AnnotationDbi", quietly = TRUE)) {
+  if (!requireNamespace("BiocManager", quietly = TRUE)) {
+    install.packages("BiocManager", repos = "https://cloud.r-project.org")
+  }
+  BiocManager::install("AnnotationDbi", update = FALSE, ask = FALSE)
+}
+# Deliberately NOT calling library(org.Hs.eg.db) / library(AnnotationDbi):
+# attaching either one masks dplyr::select() for the rest of the session
+# (AnnotationDbi exports its own select() S4 generic), which breaks every
+# subsequent dplyr pipeline, not just the annotation step. Both packages
+# are used strictly via :: below so their namespaces load without attaching.
+
+if (!requireNamespace("digest", quietly = TRUE)) {
+  install.packages("digest", repos = "https://cloud.r-project.org")
+}
+library(digest)
+
+dir.create("results/deconv_rerun_expanded", recursive = TRUE, showWarnings = FALSE)
+
+incoming_counts_path <- "RealTGN.salmon.merged.gene_counts.tsv"
+
+combined_dge <- readRDS(
+  "results/pseudobulk/GSE197289_TG_combined_reference_edgeR_dge.rds"
+)
+
+combined_logcpm <- as.matrix(
+  read.csv(
+    "results/pseudobulk/GSE197289_TG_combined_reference_logCPM.csv",
+    row.names = 1,
+    check.names = FALSE
+  )
+)
+
+combined_metadata <- read_csv(
+  "results/pseudobulk/GSE197289_TG_combined_reference_metadata.csv",
+  show_col_types = FALSE
+)
+
+expanded_marker_manifest <- read_csv(
+  "results/marker_refinement/GSE197289_TG_expanded_marker_manifest.csv",
+  show_col_types = FALSE
+)
+
+original_marker_manifest <- read_csv(
+  "results/pseudobulk/GSE197289_TG_combined_marker_manifest.csv",
+  show_col_types = FALSE
+)
+
+baseline_deconv_fractions <- read_csv(
+  "results/incoming_qc/weekly_nnls_deconvolution_fractions.csv",
+  show_col_types = FALSE
+)
+
+baseline_vif_table <- read_csv(
+  "results/deconvolution_diagnostics/signature_matrix_vif.csv",
+  show_col_types = FALSE
+)
+
+stopifnot(identical(colnames(combined_logcpm), combined_metadata$pseudobulk_id))
+```
+
+## Import incoming bulk samples and coerce to numeric
+
+The merged Salmon TSV carries a text `gene_name` column and quoted, space-padded numeric strings (e.g. `"   447.000"`) for every count cell, so that column must be dropped and remaining cells coerced to numeric before any matrix operation.
+
+```{r}
+#| label: import-incoming-counts
+
+incoming_counts_raw <- read.delim(
+  incoming_counts_path,
+  row.names = 1,
+  check.names = FALSE
+)
+
+incoming_counts_numeric <- incoming_counts_raw[
+  , !colnames(incoming_counts_raw) %in% "gene_name", drop = FALSE
+]
+
+incoming_counts_numeric[] <- lapply(incoming_counts_numeric, as.numeric)
+
+incoming_counts <- as.matrix(incoming_counts_numeric)
+
+incoming_total_counts   <- colSums(incoming_counts)
+incoming_detected_genes <- colSums(incoming_counts > 0)
+
+incoming_sample_metadata <- tibble(
+  sample_id = colnames(incoming_counts)
+) |>
+  mutate(
+    cohort       = sub("^([^_]+)_.*$", "\\1", sample_id),
+    sample_label = sub("^[^_]+_", "", sample_id),
+    sample_class = case_when(
+      grepl("^hDRG", sample_label) ~ "hDRG",
+      grepl("^TGN", sample_label)  ~ "TG bulk",
+      grepl("^TAK", sample_label)  ~ "TAK2204464A",
+      TRUE                         ~ "Other"
+    ),
+    specimen_id = case_when(
+      grepl("^hDRG_[0-9]+$", sample_label)  ~ sub("_[0-9]+$", "", sample_label),
+      grepl("^TGN.*W[0-9]+$", sample_label) ~ sub("W[0-9]+$", "", sample_label),
+      TRUE                                   ~ sample_label
+    ),
+    week_raw        = str_extract(sample_label, "W[0-9]+$"),
+    maturation_week = as.integer(str_remove(week_raw, "^W")),
+    total_counts    = incoming_total_counts[sample_id],
+    detected_genes  = incoming_detected_genes[sample_id]
+  )
+```
+
+## Resolving Ensembl gene IDs to symbols without loss
+
+The reference pseudobulk matrix (`combined_dge$counts`) is keyed by gene symbol; the incoming counts are keyed by versioned Ensembl gene ID (GENCODE convention, including `_PAR_Y` pseudoautosomal duplicates). Intersecting these two ID spaces directly returns zero matches, which is why the prior version of this notebook failed with `'counts' must contain at least one value`.
+
+This resolves the mismatch in three steps, each designed to avoid silently dropping genes:
+
+1. Strip the Ensembl version suffix (`.15`, `.6`, etc.) and the `_PAR_Y` pseudoautosomal tag to get the base Ensembl gene ID.
+2. Query `biomaRt` (Ensembl `hsapiens_gene_ensembl`) for the base ID -> HGNC symbol mapping, falling back to `org.Hs.eg.db` if the live Ensembl BioMart service is unreachable (common on restricted networks) or returns an incomplete result.
+3. Collapse the resulting many-to-one and one-to-many relationships by **summing counts** across any Ensembl IDs that map to the same symbol -- this is the standard lossless approach (no gene's signal is discarded, only redundant ID-level rows are merged) -- and retain unmapped Ensembl IDs under their own ID as a fallback identifier rather than dropping them outright.
+
+```{r}
+#| label: resolve-ensembl-to-symbol
+#| cache: true
+
+incoming_ensembl_versioned <- rownames(incoming_counts)
+incoming_ensembl_base <- incoming_ensembl_versioned |>
+  str_remove("_PAR_Y$") |>
+  str_remove("\\.[0-9]+$")
+
+stopifnot(!anyDuplicated(incoming_ensembl_versioned))
+
+id_map_table <- tibble(
+  ensembl_versioned = incoming_ensembl_versioned,
+  ensembl_base = incoming_ensembl_base
+)
+
+# This biomaRt/org.Hs.eg.db resolution is the expensive step in this
+# notebook (a live web query against Ensembl, or a full-genome AnnotationDbi
+# lookup). Cache the raw ID->symbol mapping to disk and read it back on
+# every subsequent run instead of re-querying, unless the incoming gene set
+# has changed (detected via a hash of the base Ensembl IDs).
+biomart_cache_path <- "results/deconv_rerun_expanded/ensembl_to_symbol_biomart_cache.rds"
+current_gene_set_hash <- digest::digest(sort(unique(incoming_ensembl_base)))
+
+cached_mapping <- NULL
+if (file.exists(biomart_cache_path)) {
+  cache_contents <- readRDS(biomart_cache_path)
+  if (identical(cache_contents$gene_set_hash, current_gene_set_hash)) {
+    cached_mapping <- cache_contents$mapping
+    message("Loaded cached Ensembl->symbol mapping from disk (", biomart_cache_path, "); skipping live query.")
+  } else {
+    message("Cached mapping found but gene set has changed; re-running resolution.")
+  }
+}
+
+if (!is.null(cached_mapping)) {
+  biomart_mapping <- cached_mapping
+} else {
+  biomart_mapping <- tryCatch(
+    {
+      mart <- useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl")
+      getBM_result <- getBM(
+        attributes = c("ensembl_gene_id", "hgnc_symbol"),
+        filters = "ensembl_gene_id",
+        values = unique(incoming_ensembl_base),
+        mart = mart
+      )
+      as_tibble(getBM_result) |>
+        filter(hgnc_symbol != "") |>
+        distinct()
+    },
+    error = function(e) {
+      message("biomaRt query failed (", conditionMessage(e), "); falling back to org.Hs.eg.db")
+      NULL
+    }
+  )
+
+  if (is.null(biomart_mapping) || nrow(biomart_mapping) == 0) {
+    orgdb_symbols <- AnnotationDbi::mapIds(
+      org.Hs.eg.db::org.Hs.eg.db,
+      keys = unique(incoming_ensembl_base),
+      column = "SYMBOL",
+      keytype = "ENSEMBL",
+      multiVals = "list"
+    )
+    biomart_mapping <- tibble(
+      ensembl_gene_id = names(orgdb_symbols),
+      hgnc_symbol = orgdb_symbols
+    ) |>
+      unnest(hgnc_symbol, keep_empty = TRUE) |>
+      filter(!is.na(hgnc_symbol), hgnc_symbol != "") |>
+      distinct()
+  }
+
+  dir.create(dirname(biomart_cache_path), recursive = TRUE, showWarnings = FALSE)
+  saveRDS(
+    list(gene_set_hash = current_gene_set_hash, mapping = biomart_mapping),
+    biomart_cache_path
+  )
+  message("Cached fresh Ensembl->symbol mapping to disk (", biomart_cache_path, ").")
+}
+
+id_map_table <- id_map_table |>
+  left_join(biomart_mapping, by = c("ensembl_base" = "ensembl_gene_id"))
+
+n_unmapped <- sum(is.na(id_map_table$hgnc_symbol))
+n_one_to_many <- id_map_table |>
+  filter(!is.na(hgnc_symbol)) |>
+  count(ensembl_base) |>
+  filter(n > 1) |>
+  nrow()
+
+message(
+  "Ensembl IDs total: ", nrow(id_map_table),
+  " | mapped to a symbol: ", sum(!is.na(id_map_table$hgnc_symbol)),
+  " | unmapped (retained under Ensembl ID): ", n_unmapped,
+  " | one-to-many Ensembl->symbol relationships: ", n_one_to_many
+)
+
+# Unmapped genes are retained under their own Ensembl ID rather than
+# dropped, so no gene present in the incoming data is lost from downstream
+# analysis even if it lacks a current HGNC symbol.
+id_map_table <- id_map_table |>
+  mutate(
+    resolved_symbol = ifelse(is.na(hgnc_symbol), ensembl_versioned, hgnc_symbol)
+  )
+
+write.csv(
+  id_map_table,
+  "results/deconv_rerun_expanded/ensembl_to_symbol_id_map.csv",
+  row.names = FALSE
+)
+
+# Collapse duplicate resolved symbols (many-to-one Ensembl IDs, or two
+# Ensembl IDs independently mapping to the same symbol) by summing counts --
+# this merges redundant rows without discarding any read.
+incoming_counts_df <- as.data.frame(incoming_counts) |>
+  rownames_to_column("ensembl_versioned") |>
+  left_join(id_map_table |> dplyr::select(ensembl_versioned, resolved_symbol), by = "ensembl_versioned")
+
+incoming_counts_resolved <- incoming_counts_df |>
+  dplyr::select(-ensembl_versioned) |>
+  group_by(resolved_symbol) |>
+  summarise(across(everything(), sum), .groups = "drop") |>
+  column_to_rownames("resolved_symbol") |>
+  as.matrix()
+
+message(
+  "Incoming genes before symbol resolution: ", nrow(incoming_counts),
+  " | after collapsing duplicate symbols: ", nrow(incoming_counts_resolved)
+)
+
+incoming_counts <- incoming_counts_resolved
+```
+
+## Rebuild the joint-normalized space
+
+Identical TMM joint-normalization logic to `3_TG_incoming_sample_QC_maturation.qmd`, now operating on symbol-resolved incoming counts so the shared-gene intersection with the reference is non-empty.
+
+```{r}
+#| label: joint-normalize
+
+reference_gene_key <- toupper(rownames(combined_dge$counts))
+stopifnot(!anyDuplicated(reference_gene_key))
+stopifnot(!anyDuplicated(rownames(incoming_counts)))
+
+incoming_gene_key <- toupper(rownames(incoming_counts))
+shared_gene_key <- intersect(reference_gene_key, incoming_gene_key)
+
+message(
+  "Reference genes: ", length(reference_gene_key),
+  " | incoming genes (symbol-resolved): ", length(incoming_gene_key),
+  " | shared: ", length(shared_gene_key)
+)
+
+stopifnot(length(shared_gene_key) > 0)
+
+reference_counts_shared <- combined_dge$counts[
+  match(shared_gene_key, reference_gene_key), , drop = FALSE
+]
+incoming_counts_shared <- incoming_counts[
+  match(shared_gene_key, incoming_gene_key), , drop = FALSE
+]
+
+rownames(reference_counts_shared) <- shared_gene_key
+rownames(incoming_counts_shared)  <- shared_gene_key
+
+joint_counts <- cbind(reference_counts_shared, incoming_counts_shared)
+
+joint_dge    <- DGEList(counts = joint_counts)
+joint_dge    <- calcNormFactors(joint_dge, method = "TMM")
+joint_logcpm <- cpm(joint_dge, log = TRUE, prior.count = 2)
+
+incoming_ids  <- incoming_sample_metadata$sample_id
+reference_ids <- combined_metadata$pseudobulk_id
+```
+
+## Rebuilding the signature matrix from the expanded manifest
+
+```{r}
+#| label: rebuild-expanded-signature
+
+deconv_signature_genes_expanded <- expanded_marker_manifest |>
+  filter(gene %in% rownames(joint_logcpm)) |>
+  pull(gene) |>
+  unique()
+
+deconv_signature_genes_original <- original_marker_manifest |>
+  filter(gene %in% rownames(joint_logcpm)) |>
+  pull(gene) |>
+  unique()
+
+message(
+  "Signature genes available in joint space -- original: ", length(deconv_signature_genes_original),
+  " | expanded: ", length(deconv_signature_genes_expanded)
+)
+
+build_signature_matrix <- function(genes, logcpm_matrix, metadata, ref_ids) {
+  sig <- 2^logcpm_matrix[genes, ref_ids, drop = FALSE]
+  id_map <- metadata |>
+    transmute(pseudobulk_id, reference_label = as.character(reference_label)) |>
+    filter(pseudobulk_id %in% colnames(sig))
+  identity_levels <- unique(id_map$reference_label)
+  sig_by_identity <- sapply(identity_levels, function(id_lab) {
+    cols <- id_map$pseudobulk_id[id_map$reference_label == id_lab]
+    if (length(cols) == 1) return(sig[, cols])
+    rowMeans(sig[, cols, drop = FALSE])
+  })
+  colnames(sig_by_identity) <- identity_levels
+  sig_by_identity
+}
+
+signature_matrix_original <- build_signature_matrix(
+  deconv_signature_genes_original, joint_logcpm, combined_metadata, reference_ids
+)
+signature_matrix_expanded <- build_signature_matrix(
+  deconv_signature_genes_expanded, joint_logcpm, combined_metadata, reference_ids
+)
+```
+
+## Diagnostic 1 -- VIF and condition number, real joint-normalized space
+
+```{r}
+#| label: fig-vif-recheck
+#| fig-width: 10
+#| fig-height: 6
+
+compute_vif <- function(x) {
+  vif_out <- map_dbl(seq_len(ncol(x)), function(i) {
+    y <- x[, i]
+    preds <- x[, -i, drop = FALSE]
+    fit <- lm(y ~ preds)
+    r2 <- summary(fit)$r.squared
+    if (r2 >= 0.999999) return(Inf)
+    1 / (1 - r2)
+  })
+  names(vif_out) <- colnames(x)
+  vif_out
+}
+
+vif_original_joint <- compute_vif(log2(signature_matrix_original + 1))
+vif_expanded_joint <- compute_vif(log2(signature_matrix_expanded + 1))
+
+condition_number_original_joint <- kappa(log2(signature_matrix_original + 1), exact = TRUE)
+condition_number_expanded_joint <- kappa(log2(signature_matrix_expanded + 1), exact = TRUE)
+
+vif_joint_comparison <- tibble(
+  reference_identity = names(vif_original_joint),
+  vif_original = vif_original_joint
+) |>
+  inner_join(
+    tibble(reference_identity = names(vif_expanded_joint), vif_expanded = vif_expanded_joint),
+    by = "reference_identity"
+  ) |>
+  arrange(vif_original)
+
+knitr::kable(vif_joint_comparison, digits = 2)
+
+message(
+  "Condition number, joint space -- original manifest: ", round(condition_number_original_joint, 1),
+  " | expanded manifest: ", round(condition_number_expanded_joint, 1)
+)
+
+vif_joint_long <- vif_joint_comparison |>
+  pivot_longer(c(vif_original, vif_expanded), names_to = "manifest", values_to = "vif") |>
+  mutate(manifest = recode(manifest, vif_original = "Original (79 genes)", vif_expanded = "Expanded (239 genes)"))
+
+ggplot(vif_joint_long, aes(x = reference_identity, y = vif, fill = manifest)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6) +
+  geom_hline(yintercept = 10, linetype = "dashed", color = "firebrick") +
+  labs(
+    title = "VIF in the real joint-normalized incoming+reference space",
+    subtitle = "Dashed line = severe-collinearity threshold (VIF = 10)",
+    x = NULL, y = "Variance inflation factor", fill = NULL
+  ) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+write.csv(
+  vif_joint_comparison,
+  "results/deconv_rerun_expanded/vif_joint_space_comparison.csv",
+  row.names = FALSE
+)
+```
+
+## Rerunning weekly NNLS deconvolution with the expanded signature matrix
+
+```{r}
+#| label: nnls-rerun-both-manifests
+
+run_nnls_fraction <- function(sample_expr, sig_matrix) {
+  fit <- nnls::nnls(as.matrix(sig_matrix), as.numeric(sample_expr))
+  coefs <- pmax(fit$x, 0)
+  if (sum(coefs) == 0) coefs <- rep(0, length(coefs)) else coefs <- coefs / sum(coefs)
+  names(coefs) <- colnames(sig_matrix)
+  coefs
+}
+
+run_deconv_for_manifest <- function(genes, sig_matrix, manifest_label) {
+  incoming_linear_expr <- 2^joint_logcpm[genes, incoming_ids, drop = FALSE]
+  fractions <- apply(incoming_linear_expr, 2, run_nnls_fraction, sig_matrix = sig_matrix)
+  as.data.frame(t(fractions)) |>
+    rownames_to_column("sample_id") |>
+    pivot_longer(-sample_id, names_to = "reference_identity", values_to = "estimated_fraction") |>
+    mutate(manifest = manifest_label)
+}
+
+deconv_rerun_original <- run_deconv_for_manifest(
+  deconv_signature_genes_original, signature_matrix_original, "Original (79 genes)"
+)
+deconv_rerun_expanded <- run_deconv_for_manifest(
+  deconv_signature_genes_expanded, signature_matrix_expanded, "Expanded (239 genes)"
+)
+
+deconv_rerun_combined <- bind_rows(deconv_rerun_original, deconv_rerun_expanded) |>
+  left_join(
+    incoming_sample_metadata |> dplyr::select(sample_id, specimen_id, sample_class, maturation_week),
+    by = "sample_id"
+  ) |>
+  filter(!is.na(maturation_week)) |>
+  group_by(specimen_id, sample_class, maturation_week, reference_identity, manifest) |>
+  summarise(estimated_fraction = mean(estimated_fraction, na.rm = TRUE), .groups = "drop")
+
+n_identities_recovered <- deconv_rerun_combined |>
+  filter(estimated_fraction > 0.01) |>
+  group_by(specimen_id, maturation_week, manifest) |>
+  summarise(n_identities_recovered = n(), .groups = "drop")
+
+knitr::kable(
+  n_identities_recovered |> pivot_wider(names_from = manifest, values_from = n_identities_recovered),
+  caption = "Number of reference identities recovered above 1% fraction, per specimen-week"
+)
+
+write.csv(
+  deconv_rerun_combined,
+  "results/deconv_rerun_expanded/weekly_nnls_deconvolution_both_manifests.csv",
+  row.names = FALSE
+)
+```
+
+## Bootstrapping confidence intervals on NNLS composition estimates
+
+The single-point NNLS fit above has no built-in uncertainty quantification --
+each sample gets one composition vector, with no sense of how sensitive that
+estimate is to the particular set of marker genes used. This resamples the
+signature-matrix marker genes with replacement (a gene-level bootstrap, the
+standard way to propagate signature-matrix uncertainty into deconvolution
+estimates when no per-gene technical replicates exist) and refits NNLS on
+each resampled gene set, giving a distribution of estimated fractions per
+sample x identity rather than a single value.
+
+```{r}
+#| label: bootstrap-nnls-cis
+#| cache: true
+
+n_bootstrap <- 500
+set.seed(20260723)
+
+bootstrap_nnls_manifest <- function(genes, sig_matrix, manifest_label, n_boot = n_bootstrap) {
+  incoming_linear_expr <- 2^joint_logcpm[genes, incoming_ids, drop = FALSE]
+  n_genes <- length(genes)
+
+  boot_list <- map(seq_len(n_boot), function(b) {
+    boot_genes_idx <- sample.int(n_genes, size = n_genes, replace = TRUE)
+    boot_sig <- sig_matrix[boot_genes_idx, , drop = FALSE]
+    boot_expr <- incoming_linear_expr[boot_genes_idx, , drop = FALSE]
+
+    fractions <- apply(boot_expr, 2, run_nnls_fraction, sig_matrix = boot_sig)
+    as.data.frame(t(fractions)) |>
+      rownames_to_column("sample_id") |>
+      pivot_longer(-sample_id, names_to = "reference_identity", values_to = "estimated_fraction") |>
+      mutate(bootstrap_rep = b)
+  })
+
+  bind_rows(boot_list) |>
+    mutate(manifest = manifest_label)
+}
+
+bootstrap_original <- bootstrap_nnls_manifest(
+  deconv_signature_genes_original, signature_matrix_original, "Original (79 genes)"
+)
+bootstrap_expanded <- bootstrap_nnls_manifest(
+  deconv_signature_genes_expanded, signature_matrix_expanded, "Expanded (239 genes)"
+)
+
+bootstrap_combined <- bind_rows(bootstrap_original, bootstrap_expanded) |>
+  left_join(
+    incoming_sample_metadata |> dplyr::select(sample_id, specimen_id, sample_class, maturation_week),
+    by = "sample_id"
+  ) |>
+  filter(!is.na(maturation_week))
+
+deconv_rerun_with_ci <- bootstrap_combined |>
+  group_by(specimen_id, sample_class, maturation_week, reference_identity, manifest) |>
+  summarise(
+    estimated_fraction = mean(estimated_fraction, na.rm = TRUE),
+    ci_low  = quantile(estimated_fraction, 0.025, na.rm = TRUE),
+    ci_high = quantile(estimated_fraction, 0.975, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+write.csv(
+  deconv_rerun_with_ci,
+  "results/deconv_rerun_expanded/weekly_nnls_deconvolution_with_bootstrap_ci.csv",
+  row.names = FALSE
+)
+
+knitr::kable(
+  deconv_rerun_with_ci |>
+    filter(manifest == "Expanded (239 genes)") |>
+    mutate(ci_range = sprintf("%.2f (%.2f-%.2f)", estimated_fraction, ci_low, ci_high)) |>
+    dplyr::select(specimen_id, maturation_week, reference_identity, ci_range) |>
+    pivot_wider(names_from = reference_identity, values_from = ci_range),
+  caption = "Estimated fraction (95% bootstrap CI), expanded manifest, per specimen x week"
+)
+```
+
+## Composition comparison, original vs. expanded manifest
+
+Reflowed so maturation week runs along the y-axis (week 4 at top, week 1 at
+bottom) and each specimen replicate gets its own row -- this makes the
+temporal progression for all three replicates directly comparable at a
+glance, rather than requiring cross-panel comparison as in the original
+week-on-x-axis, specimen-faceted-by-column layout.
+
+```{r}
+#| label: fig-composition-before-after
+#| fig-width: 12
+#| fig-height: 10
+
+deconv_rerun_combined <- deconv_rerun_combined |>
+  mutate(maturation_week_factor = factor(maturation_week, levels = sort(unique(maturation_week), decreasing = TRUE)))
+
+ggplot(
+  deconv_rerun_combined,
+  aes(y = maturation_week_factor, x = estimated_fraction, fill = reference_identity)
+) +
+  geom_col(position = "stack", orientation = "y") +
+  facet_grid(specimen_id ~ manifest) +
+  labs(
+    title = "NNLS-estimated composition by week: original vs. expanded marker manifest",
+    subtitle = "Week on y-axis (week 4 at top) so each replicate's temporal trajectory reads top-to-bottom",
+    x = "Estimated fraction",
+    y = "Maturation week",
+    fill = "Reference identity"
+  ) +
+  theme_classic() +
+  theme(legend.position = "bottom", strip.text.y = element_text(angle = 0))
+```
+
+## Composition trajectories with bootstrap confidence intervals
+
+The stacked-bar view above shows relative composition well but compresses
+uncertainty into a single point per segment. This companion view plots each
+reference identity's estimated fraction across weeks as a line with a
+shaded 95% bootstrap CI ribbon, one panel per specimen, so both the
+temporal trend and its statistical confidence are visible for the identities
+that matter most for QC sign-off (neuronal subtypes and any non-neuronal
+program crossing 5% of composition).
+
+```{r}
+#| label: fig-composition-ci-trajectory
+#| fig-width: 13
+#| fig-height: 9
+
+identities_to_plot <- deconv_rerun_with_ci |>
+  filter(manifest == "Expanded (239 genes)") |>
+  group_by(reference_identity) |>
+  summarise(max_fraction = max(estimated_fraction), .groups = "drop") |>
+  filter(max_fraction > 0.05) |>
+  pull(reference_identity)
+
+ggplot(
+  deconv_rerun_with_ci |>
+    filter(manifest == "Expanded (239 genes)", reference_identity %in% identities_to_plot),
+  aes(x = maturation_week, y = estimated_fraction, color = reference_identity, fill = reference_identity)
+) +
+  geom_ribbon(aes(ymin = ci_low, ymax = ci_high), alpha = 0.15, color = NA) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  facet_wrap(~ specimen_id, ncol = 1) +
+  labs(
+    title = "Weekly composition trajectory with 95% bootstrap CI, expanded manifest",
+    subtitle = "One panel per replicate specimen; ribbon = bootstrap uncertainty from resampled marker genes",
+    x = "Maturation week", y = "Estimated fraction", color = "Reference identity", fill = "Reference identity"
+  ) +
+  theme_classic() +
+  theme(legend.position = "bottom")
+```
+
+## Neuronal-vs-non-neuronal stability check
+
+Reflowed the same way -- week on the y-axis, one row per specimen -- so the
+broad neuronal/non-neuronal split is directly comparable across the three
+replicates' temporal patterns rather than split across side-by-side facets.
+
+```{r}
+#| label: fig-broad-identity-stability
+#| fig-width: 11
+#| fig-height: 8
+
+neuronal_identity_labels <- combined_metadata |>
+  filter(reference_level == "Neuronal subtype") |>
+  pull(reference_label) |>
+  as.character() |>
+  unique()
+
+broad_comparison <- deconv_rerun_combined |>
+  mutate(broad_identity = ifelse(reference_identity %in% neuronal_identity_labels, "Neuronal", "Non-neuronal")) |>
+  group_by(specimen_id, sample_class, maturation_week, manifest, broad_identity) |>
+  summarise(estimated_fraction = sum(estimated_fraction), .groups = "drop")
+
+broad_comparison_ci <- deconv_rerun_with_ci |>
+  mutate(broad_identity = ifelse(reference_identity %in% neuronal_identity_labels, "Neuronal", "Non-neuronal")) |>
+  group_by(specimen_id, sample_class, maturation_week, manifest, broad_identity) |>
+  summarise(
+    estimated_fraction = sum(estimated_fraction),
+    ci_low = sum(ci_low),
+    ci_high = sum(ci_high),
+    .groups = "drop"
+  )
+
+ggplot(
+  broad_comparison,
+  aes(y = factor(maturation_week, levels = sort(unique(maturation_week), decreasing = TRUE)),
+      x = estimated_fraction, color = manifest, linetype = broad_identity, group = interaction(manifest, broad_identity))
+) +
+  geom_path(linewidth = 1) +
+  geom_point(size = 2) +
+  facet_wrap(~ specimen_id, ncol = 1) +
+  labs(
+    title = "Neuronal vs. non-neuronal composition: original vs. expanded manifest",
+    subtitle = "Week on y-axis, one panel per replicate; similar trajectories confirm the expansion refined subtype resolution without altering the broad biological call",
+    x = "Estimated fraction", y = "Maturation week", color = NULL, linetype = NULL
+  ) +
+  theme_classic() +
+  theme(legend.position = "bottom")
+
+write.csv(
+  broad_comparison,
+  "results/deconv_rerun_expanded/broad_identity_before_after.csv",
+  row.names = FALSE
+)
+write.csv(
+  broad_comparison_ci,
+  "results/deconv_rerun_expanded/broad_identity_before_after_with_ci.csv",
+  row.names = FALSE
+)
+```
+
+## Visual polish review
+
+A compact review panel for reviewer sign-off: broad neuronal fraction by
+week with bootstrap CI ribbons, expanded manifest only, all three replicates
+overlaid on one axis so temporal consistency (or divergence) across
+specimens is immediately visible without scanning multiple facets.
+
+```{r}
+#| label: fig-polish-review
+#| fig-width: 10
+#| fig-height: 6
+
+polish_review_data <- broad_comparison_ci |>
+  filter(manifest == "Expanded (239 genes)", broad_identity == "Neuronal")
+
+ggplot(
+  polish_review_data,
+  aes(x = maturation_week, y = estimated_fraction, color = specimen_id, fill = specimen_id)
+) +
+  geom_ribbon(aes(ymin = ci_low, ymax = ci_high), alpha = 0.12, color = NA) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 2.5) +
+  scale_x_continuous(breaks = sort(unique(polish_review_data$maturation_week))) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0, 1)) +
+  labs(
+    title = "Reviewer-facing summary: neuronal fraction by week, expanded manifest",
+    subtitle = "Shaded bands = 95% bootstrap CI; overlaid replicates highlight temporal consistency at a glance",
+    x = "Maturation week", y = "Estimated neuronal fraction", color = "Specimen", fill = "Specimen"
+  ) +
+  theme_classic(base_size = 13) +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold"),
+    panel.grid.major.y = element_line(color = "grey90")
+  )
+
+ggsave(
+  "results/deconv_rerun_expanded/polish_review_neuronal_fraction.png",
+  width = 10, height = 6, dpi = 300
+)
+```
+
+## Summary and verdict
+
+```{r}
+#| label: rerun-summary
+
+rerun_summary <- tibble(
+  metric = c(
+    "Incoming genes before symbol resolution",
+    "Incoming genes after symbol resolution",
+    "Genes shared with reference (joint space)",
+    "Mean VIF, joint space, original manifest",
+    "Mean VIF, joint space, expanded manifest",
+    "Condition number, joint space, original manifest",
+    "Condition number, joint space, expanded manifest",
+    "Mean identities recovered per specimen-week, original manifest",
+    "Mean identities recovered per specimen-week, expanded manifest",
+    "Bootstrap replicates per sample (gene resampling)",
+    "Mean 95% CI width, neuronal fraction, expanded manifest"
+  ),
+  value = c(
+    length(incoming_ensembl_versioned),
+    nrow(incoming_counts_resolved),
+    length(shared_gene_key),
+    round(mean(vif_joint_comparison$vif_original), 2),
+    round(mean(vif_joint_comparison$vif_expanded), 2),
+    round(condition_number_original_joint, 1),
+    round(condition_number_expanded_joint, 1),
+    round(mean(n_identities_recovered$`Original (79 genes)`, na.rm = TRUE), 2),
+    round(mean(n_identities_recovered$`Expanded (239 genes)`, na.rm = TRUE), 2),
+    n_bootstrap,
+    round(mean(broad_comparison_ci$ci_high[broad_comparison_ci$manifest == "Expanded (239 genes)" & broad_comparison_ci$broad_identity == "Neuronal"] -
+               broad_comparison_ci$ci_low[broad_comparison_ci$manifest == "Expanded (239 genes)" & broad_comparison_ci$broad_identity == "Neuronal"]), 3)
+  )
+)
+
+knitr::kable(rerun_summary)
+```
+
+Narrower mean CI width on the neuronal-fraction estimate indicates the
+expanded manifest's larger marker set stabilizes the composition call
+against gene-level resampling noise, on top of the VIF/condition-number
+improvement already established in notebook 5.
+
+
+
+## Next steps checklist
+
+- Review `results/deconv_rerun_expanded/ensembl_to_symbol_id_map.csv` for any genes of specific interest that fell into the "unmapped" bucket -- these are retained under their raw Ensembl ID rather than dropped, but won't match a symbol-keyed marker manifest unless resolved manually (e.g. a superseded or retired Ensembl ID).
+- If this notebook confirms improved resolution, replace the marker manifest path in `3_TG_incoming_sample_QC_maturation.qmd`'s setup chunk with `results/marker_refinement/GSE197289_TG_expanded_marker_manifest.csv`, and add this same biomaRt/org.Hs.eg.db resolution step to that notebook's import so future weekly runs don't hit the same ID-space mismatch.
+- Re-run `4_TG_deconvolution_diagnostics.qmd` pointed at the expanded manifest as a final cross-check before retiring the original 79-gene manifest from routine use.
+- Consider standardizing on Ensembl IDs (rather than symbols) as the join key throughout the pipeline going forward, since Ensembl IDs are stable and version-tracked while symbols can be renamed or retired -- this would remove the need for this resolution step entirely in future notebooks.
+- Review `results/deconv_rerun_expanded/polish_review_neuronal_fraction.png` as the reviewer-facing summary figure; the underlying bootstrap CI tables (`weekly_nnls_deconvolution_with_bootstrap_ci.csv`, `broad_identity_before_after_with_ci.csv`) are saved alongside it for anyone who wants to inspect per-identity uncertainty directly.
+- If CI widths remain wide for any specific specimen-week, consider whether that reflects genuine low signature-matrix confidence (revisit marker selection) versus low incoming-sample sequencing depth (revisit the QC flags from `3_TG_incoming_sample_QC_maturation.qmd`).

@@ -1,0 +1,24 @@
+gene,figure_block,manuscript_role,present_in_counts
+SIX1,Cranial sensory lineage,cranial sensory developmental context,TRUE
+EYA1,Cranial sensory lineage,SIX1 co-regulatory context,TRUE
+SOX10,Cranial sensory lineage,neural-crest-associated developmental state,TRUE
+ISL1,Sensory neurogenesis,sensory neuronal differentiation,TRUE
+POU4F1,Sensory neurogenesis,BRN3A; sensory neuronal differentiation,TRUE
+PRDM12,Sensory neurogenesis,nociceptor-lineage regulatory context,TRUE
+RBFOX3,Neuronal architecture,neuronal identity,TRUE
+TUBB3,Neuronal architecture,neuronal cytoskeletal identity,TRUE
+SNAP25,Neuronal architecture,synaptic architecture,TRUE
+SCN5A,NaV channel context,NaV1.5 comparator,TRUE
+SCN8A,NaV channel context,NaV1.6 comparator,TRUE
+SCN9A,NaV channel context,NaV1.7 sensory channel context,TRUE
+SCN10A,NaV channel context,NaV1.8 molecular context,TRUE
+SCN11A,NaV channel context,NaV1.9 sensory channel context,TRUE
+TRPV1,Sensory context and boundaries,heat/nociceptor context,TRUE
+TRPM8,Sensory context and boundaries,cold-sensory context,TRUE
+P2RX3,Sensory context and boundaries,sensory/nociceptor context,TRUE
+NTRK1,Sensory context and boundaries,TRKA sensory context,TRUE
+NTRK2,Sensory context and boundaries,TRKB sensory context,TRUE
+NTRK3,Sensory context and boundaries,TRKC sensory context,TRUE
+PIEZO2,Sensory context and boundaries,mechanosensory context,TRUE
+CALCA,Sensory context and boundaries,peptidergic boundary,TRUE
+CALCB,Sensory context and boundaries,peptidergic boundary,TRUE
