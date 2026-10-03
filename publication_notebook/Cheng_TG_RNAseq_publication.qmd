@@ -18,6 +18,8 @@ The preparation/sequence-run assumption is two hDRG source samples/libraries, ea
 
 ## Input contract and environment
 
+The 15-sample Salmon estimated gene-count matrix and sample metadata are planned for NCBI GEO under BioProject PRJNA1538692; a GEO accession is pending. This processed matrix is not the exact corrected paired-control input used below. The pinned analysis input and frozen reference objects are listed in `DATA_REQUIREMENTS.md` and need their own public locations.
+
 Render from the repository with a local copy of the corrected count matrix. Set `TG_CORRECTED_COUNTS` to that file. The notebook does not fetch protected data or install packages during rendering. It writes a separate `publication_notebook/output/` candidate set; it never overwrites `RealTGN.salmon.merged.gene_counts.tsv` or prior figure runs.
 
 ```{r}

@@ -4,9 +4,13 @@ The [Quarto analysis notebook](Cheng_TG_RNAseq_publication.qmd) is the curated p
 
 Author-confirmed identity mapping: source `hDRG` = hDRG 1; source `TAK2204464A` = hDRG 2. The code and tables retain the source identifiers and provide `sample_label_key.csv` for plot labels. C1/C2 are technical sequencing runs within each of these two source samples, not four biological replicates.
 
+## Processed data location
+
+The 15-sample Salmon estimated gene-count matrix and sample metadata are planned for NCBI GEO, linked to BioProject PRJNA1538692. Add the GEO accession here when assigned. These processed data are separate from the exact corrected paired-control matrix and reference objects required to rerun the final figure code. See [`../DATA_REQUIREMENTS.md`](../DATA_REQUIREMENTS.md) for the full input list.
+
 ## Reproduce this notebook
 
-1. Download the corrected `salmon.merged.gene_counts.tsv` from the study data deposit (accession pending) to a local path. Its expected SHA-256 is pinned in the notebook.
+1. Obtain the corrected `salmon.merged.gene_counts.tsv` analysis input from the study data deposit (location pending) and place it at a local path. Its expected SHA-256 is pinned in the notebook.
 2. From the repository root, set `TG_CORRECTED_COUNTS` to the local absolute path and run `quarto render publication_notebook/Cheng_TG_RNAseq_publication.qmd --to html`.
 3. Review `publication_notebook/output/` for input/panel manifests, normalization and label tables, underlying value/coordinate tables, comparisons with legacy results, the individual panels, and both detachable keys. Generated results are deliberately excluded from Git by the existing ignore rules. Share data/results separately from code.
 

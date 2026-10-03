@@ -1,6 +1,8 @@
 # Data required for a full render
 
-Extract `Cheng_TGN_RNAseq_analysis_inputs.zip` under the repository root to place the following files at these relative paths. They are deliberately excluded from Git and need a public data deposit with access and redistribution rights confirmed. The separate `Cheng_TGN_RNAseq_hDRG_paired_controls.tsv` is specified by `TG_CORRECTED_COUNTS` and must match the SHA-256 in the notebook.
+The 15-sample Salmon estimated gene-count matrix and matching sample metadata are planned for NCBI GEO under BioProject PRJNA1538692. The GEO accession is pending. That public matrix is not the same file as the corrected paired-control input pinned by the publication notebook. A full render also needs the frozen reference objects and other inputs listed below; their public locations are pending.
+
+Extract `Cheng_TGN_RNAseq_analysis_inputs.zip` under the repository root to place the following files at these relative paths. They are deliberately excluded from Git; their public deposit locations are still pending. The separate `Cheng_TGN_RNAseq_hDRG_paired_controls.tsv` is specified by `TG_CORRECTED_COUNTS` and must match the SHA-256 in the notebook.
 
 | Relative path | Local size |
 | --- | ---: |
