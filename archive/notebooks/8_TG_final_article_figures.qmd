@@ -1,0 +1,667 @@
+---
+title: "Final Article Figures: Replicate-Aware Neuronal Maturity and Relative Composition"
+subtitle: "Pipeline step 8 of 8 — single-source regeneration of manuscript statistics, direct key-gene evidence, and final figures"
+author: "Austin Hovland"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+    css: styles/anatomic.css
+    fig-dpi: 300
+    fig-retina: 1
+editor: visual
+execute:
+  echo: true
+  warning: false
+  message: false
+  cache: false
+---
+
+## Purpose
+
+This notebook is the sole manuscript-facing regeneration point for the final RNA-seq figures. It does not redefine the upstream reference or marker panel. Instead, it reads the validated outputs of notebooks 1–7 and produces a concise, replicate-aware answer to two questions:
+
+1. Do the three matched TG cell-line replicates show a coherent trajectory in neuronal maturity?
+2. Which sensory-identity signatures contribute to the bulk profiles, and how sensitive are those estimates to the marker genes used?
+
+The matched biological unit is the cell line (`n = 3` at weeks 1–4). There is one bulk RNA-seq library per cell line at each sampled week. A W1-only TG sample is retained in upstream QC records but excluded from paired longitudinal statistics because it has no matched later weeks. NNLS values are reported as **relative transcriptional signature contributions**, not literal cell fractions.
+
+## Setup and input checks
+
+```{r}
+#| label: setup
+
+library(dplyr)
+library(tidyr)
+library(readr)
+library(tibble)
+library(stringr)
+library(ggplot2)
+library(patchwork)
+library(edgeR)
+library(scales)
+
+source("R/anatomic_theme.R")
+
+output_dir <- "results/final_article"
+publication_run <- Sys.getenv("PUBLICATION_RUN", "2026-08-04")
+figure_dir <- file.path("publication_runs", publication_run, "final_article_figures")
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(figure_dir, recursive = TRUE, showWarnings = FALSE)
+
+sample_metadata <- read_csv(
+  "results/incoming_qc/incoming_sample_metadata.csv",
+  show_col_types = FALSE
+)
+aggregate_index <- read_csv(
+  "results/incoming_qc/aggregate_neuronal_identity_index.csv",
+  show_col_types = FALSE
+)
+weekly_pca <- read_csv(
+  "results/incoming_qc/weekly_neuron_only_pca_trajectory_coordinates.csv",
+  show_col_types = FALSE
+)
+composition_ci <- read_csv(
+  "results/deconv_rerun_expanded/weekly_nnls_deconvolution_with_bootstrap_ci.csv",
+  show_col_types = FALSE
+)
+signed_scores <- read_csv(
+  "results/deconv_rerun_expanded/weekly_signed_refined_identity_scores.csv",
+  show_col_types = FALSE
+)
+combined_reference_metadata <- read_csv(
+  "results/pseudobulk/GSE197289_TG_combined_reference_metadata.csv",
+  show_col_types = FALSE
+)
+
+complete_lines <- sample_metadata |>
+  filter(sample_class == "TG bulk", !is.na(maturation_week)) |>
+  distinct(specimen_id, maturation_week) |>
+  count(specimen_id, name = "n_sampled_weeks") |>
+  filter(n_sampled_weeks == 4L) |>
+  pull(specimen_id)
+
+stopifnot(length(complete_lines) == 3L)
+
+matched_metadata <- sample_metadata |>
+  filter(specimen_id %in% complete_lines, maturation_week %in% 1:4) |>
+  arrange(specimen_id, maturation_week)
+
+knitr::kable(
+  matched_metadata |>
+    select(sample_id, specimen_id, maturation_week, cohort),
+  caption = "Matched biological cell-line replicates included in final longitudinal inference"
+)
+```
+
+## Memory-safe Extended Data regeneration
+
+The two Extended Data composites are rendered in separate, clean R processes before the main figures are built. This preserves a single notebook command while releasing the large reference object and graphics memory between figures.
+
+```{r}
+#| label: render-extended-data-subprocesses
+#| output: false
+
+render_extended_data <- function(target) {
+  status <- system2("Rscript", c("scripts/build_final_article_extended_data.R", target))
+  if (!identical(status, 0L)) {
+    stop("Extended Data render failed for target: ", target)
+  }
+}
+render_extended_data("analysis-context")
+gc()
+render_extended_data("reference-calibration")
+gc()
+status <- system2("Rscript", "scripts/build_final_article_main_figures.R")
+if (!identical(status, 0L)) {
+  stop("Main figure render failed")
+}
+gc()
+status <- system2("Rscript", "scripts/build_publication_run_methods_figure.R")
+if (!identical(status, 0L)) {
+  stop("Extended Data Figure 3 render failed")
+}
+gc()
+```
+
+## Direct expression of prespecified key genes
+
+The final figures show direct log-CPM expression for neuronal architecture genes (*RBFOX3*, *SNAP25*), the three culture-associated identity axes (*CASQ2/P2RY1*, *NTRK3/PVALB*, and *NTRK2/PIEZO2*), and a Schwann-cell counter-program (*SOX10*). Counts are TMM-normalized across the incoming libraries, and each line is retained rather than collapsed before plotting.
+
+```{r}
+#| label: direct-key-gene-expression
+
+incoming_counts <- read_tsv(
+  "RealTGN.salmon.merged.gene_counts.tsv",
+  show_col_types = FALSE,
+  name_repair = "minimal"
+)
+
+matched_sample_ids <- matched_metadata$sample_id
+incoming_count_table <- incoming_counts |>
+  select(gene_name, all_of(matched_sample_ids)) |>
+  mutate(gene_name = toupper(gene_name))
+
+incoming_count_matrix <- as.matrix(incoming_count_table[, matched_sample_ids, drop = FALSE])
+rownames(incoming_count_matrix) <- incoming_count_table[["gene_name"]]
+
+storage.mode(incoming_count_matrix) <- "numeric"
+incoming_count_matrix <- rowsum(incoming_count_matrix, group = rownames(incoming_count_matrix), reorder = FALSE)
+incoming_dge <- calcNormFactors(DGEList(counts = incoming_count_matrix), method = "TMM")
+incoming_logcpm <- cpm(incoming_dge, log = TRUE, prior.count = 2)
+
+key_gene_dictionary <- tribble(
+  ~gene, ~program,
+  "RBFOX3", "Pan-neuronal",
+  "SNAP25", "Pan-neuronal",
+  "SCN10A", "Nav1.8 nociceptor program",
+  "CASQ2", "C-LTMR-like",
+  "P2RY1", "C-LTMR-like",
+  "NTRK3", "A-beta-LTMR-like",
+  "PVALB", "A-beta-LTMR-like",
+  "NTRK2", "A-delta-LTMR-like",
+  "PIEZO2", "A-delta-LTMR-like",
+  "SOX10", "Schwann counter-program"
+) |>
+  filter(gene %in% rownames(incoming_logcpm))
+
+key_gene_expression <- incoming_logcpm[key_gene_dictionary$gene, , drop = FALSE] |>
+  as.data.frame() |>
+  rownames_to_column("gene") |>
+  pivot_longer(-gene, names_to = "sample_id", values_to = "log_cpm") |>
+  left_join(key_gene_dictionary, by = "gene") |>
+  left_join(
+    matched_metadata |>
+      select(sample_id, specimen_id, maturation_week),
+    by = "sample_id"
+  ) |>
+  arrange(program, gene, specimen_id, maturation_week)
+
+write_csv(key_gene_expression, file.path(output_dir, "key_gene_expression_logcpm.csv"))
+```
+
+## Replicate-aware summary and trend functions
+
+For each endpoint, the notebook reports raw trajectories, the mean across the three biological lines, and a t-based 95% confidence interval. The linear trend is estimated in a blocked model with cell line as a fixed effect; line-specific slopes are also reported, making it possible to distinguish a shared directional signal from one dominant line.
+
+```{r}
+#| label: replicate-aware-statistics
+
+summarise_replicates <- function(data, value_column, grouping) {
+  data |>
+    group_by(across(all_of(grouping))) |>
+    summarise(
+      n_lines = sum(!is.na(.data[[value_column]])),
+      mean_value = mean(.data[[value_column]], na.rm = TRUE),
+      sd_value = sd(.data[[value_column]], na.rm = TRUE),
+      se_value = sd_value / sqrt(n_lines),
+      t_critical = qt(0.975, df = pmax(n_lines - 1, 1)),
+      ci_low = mean_value - t_critical * se_value,
+      ci_high = mean_value + t_critical * se_value,
+      .groups = "drop"
+    )
+}
+
+blocked_trend <- function(data, value_column, endpoint) {
+  model_data <- data |>
+    select(specimen_id, maturation_week, value = all_of(value_column)) |>
+    filter(!is.na(value))
+  fit <- lm(value ~ maturation_week + specimen_id, data = model_data)
+  coefficient_table <- summary(fit)$coefficients
+  slopes <- model_data |>
+    group_by(specimen_id) |>
+    summarise(
+      line_slope = unname(coef(lm(value ~ maturation_week))["maturation_week"]),
+      .groups = "drop"
+    )
+  slope_test <- t.test(slopes$line_slope, mu = 0)
+  tibble(
+    endpoint = endpoint,
+    blocked_slope_per_week = coefficient_table["maturation_week", "Estimate"],
+    blocked_slope_ci_low = coefficient_table["maturation_week", "Estimate"] -
+      qt(0.975, df = df.residual(fit)) * coefficient_table["maturation_week", "Std. Error"],
+    blocked_slope_ci_high = coefficient_table["maturation_week", "Estimate"] +
+      qt(0.975, df = df.residual(fit)) * coefficient_table["maturation_week", "Std. Error"],
+    blocked_slope_p_value = coefficient_table["maturation_week", "Pr(>|t|)"],
+    mean_line_slope = mean(slopes$line_slope),
+    line_slope_p_value = slope_test$p.value,
+    n_biological_lines = nrow(slopes)
+  )
+}
+
+plot_replicate_trajectory <- function(raw_data, summary_data, y_column, y_label, title, subtitle = NULL) {
+  ggplot(raw_data, aes(x = maturation_week, y = .data[[y_column]], group = specimen_id, color = specimen_id)) +
+    geom_line(linewidth = 0.7, alpha = 0.65) +
+    geom_point(size = 2, alpha = 0.8) +
+    geom_ribbon(
+      data = summary_data,
+      aes(x = maturation_week, ymin = ci_low, ymax = ci_high, group = 1),
+      inherit.aes = FALSE, fill = anatomic_brand[["red"]], alpha = 0.12
+    ) +
+    geom_line(
+      data = summary_data,
+      aes(x = maturation_week, y = mean_value, group = 1),
+      inherit.aes = FALSE, linewidth = 1.15, color = anatomic_brand[["red"]]
+    ) +
+    geom_point(
+      data = summary_data,
+      aes(x = maturation_week, y = mean_value),
+      inherit.aes = FALSE, size = 2.7, shape = 21, fill = "white", color = anatomic_brand[["red"]], stroke = 0.9
+    ) +
+    scale_x_continuous(breaks = 1:4) +
+    labs(title = title, subtitle = subtitle, x = "Culture week", y = y_label, color = "Biological line") +
+    theme_anatomic() +
+    theme(legend.position = "bottom")
+}
+```
+
+## Maturity endpoints
+
+```{r}
+#| label: maturity-statistics
+
+maturity_data <- aggregate_index |>
+  filter(specimen_id %in% complete_lines, maturation_week %in% 1:4) |>
+  arrange(specimen_id, maturation_week)
+maturity_summary <- summarise_replicates(
+  maturity_data, "neuronal_identity_index", "maturation_week"
+)
+pca_data <- weekly_pca |>
+  filter(specimen_id %in% complete_lines, maturation_week %in% 1:4) |>
+  arrange(specimen_id, maturation_week)
+pca_summary <- summarise_replicates(pca_data, "PC1", "maturation_week")
+
+maturity_trend_summary <- bind_rows(
+  blocked_trend(maturity_data, "neuronal_identity_index", "Aggregate neuronal identity index"),
+  blocked_trend(pca_data, "PC1", "Neuron-only reference PC1")
+)
+
+key_gene_trend_summary <- key_gene_expression |>
+  group_by(gene, program) |>
+  group_modify(~ blocked_trend(.x, "log_cpm", endpoint = unique(.x$gene))) |>
+  ungroup()
+
+write_csv(maturity_summary, file.path(output_dir, "maturity_weekly_replicate_summary.csv"))
+write_csv(maturity_trend_summary, file.path(output_dir, "maturity_blocked_trend_summary.csv"))
+write_csv(key_gene_trend_summary, file.path(output_dir, "key_gene_blocked_trend_summary.csv"))
+
+knitr::kable(maturity_trend_summary, digits = 3, caption = "Blocked longitudinal trend estimates across the three biological cell lines")
+```
+
+## Estimated relative composition
+
+The composition analysis uses the donor-refined, 788-gene NNLS manifest. The three interpretable culture-associated axes are shown separately; all remaining neuronal and non-neuronal reference identities are retained as explicit residual categories. Mean trajectories and their biological-replicate confidence intervals are shown separately from the per-line gene-bootstrap sensitivity intervals.
+
+```{r}
+#| label: composition-summaries
+
+identity_lookup <- combined_reference_metadata |>
+  distinct(reference_identity = reference_label, reference_level)
+
+dominant_identity_labels <- c("cLTMR__SC01", "NF2__SC03", "NF3__SC02")
+composition_matched <- composition_ci |>
+  filter(
+    specimen_id %in% complete_lines,
+    maturation_week %in% 1:4,
+    manifest == "Signed refined (788 genes)"
+  ) |>
+  left_join(identity_lookup, by = "reference_identity") |>
+  mutate(
+    composition_class = case_when(
+      reference_identity == "cLTMR__SC01" ~ "C-LTMR-like (CASQ2/P2RY1)",
+      reference_identity == "NF2__SC03" ~ "A-beta-LTMR-like (NTRK3/PVALB)",
+      reference_identity == "NF3__SC02" ~ "A-delta-LTMR-like (NTRK2/PIEZO2)",
+      reference_level == "Neuronal subtype" ~ "Other neuronal identities",
+      TRUE ~ "Non-neuronal / off-target"
+    )
+  )
+
+composition_class <- composition_matched |>
+  group_by(specimen_id, maturation_week, composition_class) |>
+  summarise(
+    estimated_fraction = sum(estimated_fraction),
+    gene_ci_low = sum(ci_low),
+    gene_ci_high = sum(ci_high),
+    .groups = "drop"
+  )
+
+composition_summary <- summarise_replicates(
+  composition_class, "estimated_fraction", c("maturation_week", "composition_class")
+)
+composition_gene_sensitivity <- composition_class |>
+  group_by(maturation_week, composition_class) |>
+  summarise(
+    mean_gene_ci_low = mean(gene_ci_low),
+    mean_gene_ci_high = mean(gene_ci_high),
+    .groups = "drop"
+  )
+
+signed_class_scores <- signed_scores |>
+  filter(
+    specimen_id %in% complete_lines,
+    maturation_week %in% 1:4,
+    refined_identity %in% dominant_identity_labels
+  ) |>
+  mutate(
+    composition_class = recode(
+      refined_identity,
+      "cLTMR__SC01" = "C-LTMR-like (CASQ2/P2RY1)",
+      "NF2__SC03" = "A-beta-LTMR-like (NTRK3/PVALB)",
+      "NF3__SC02" = "A-delta-LTMR-like (NTRK2/PIEZO2)"
+    )
+  )
+signed_summary <- summarise_replicates(
+  signed_class_scores, "signed_score", c("maturation_week", "composition_class")
+)
+
+write_csv(composition_class, file.path(output_dir, "relative_composition_by_biological_line.csv"))
+write_csv(composition_summary, file.path(output_dir, "relative_composition_replicate_summary.csv"))
+write_csv(composition_gene_sensitivity, file.path(output_dir, "relative_composition_gene_bootstrap_summary.csv"))
+```
+
+## Final Figure 1 — neuronal maturity
+
+```{r}
+#| label: fig-final-maturity
+#| eval: false
+#| fig-width: 15
+#| fig-height: 10
+
+p_maturity <- plot_replicate_trajectory(
+  maturity_data, maturity_summary, "neuronal_identity_index",
+  "Aggregate neuronal identity index",
+  "Replicate-aware aggregate neuronal identity"
+)
+
+p_key_genes <- ggplot(
+  key_gene_expression,
+  aes(x = maturation_week, y = log_cpm, group = specimen_id, color = specimen_id)
+) +
+  geom_line(linewidth = 0.55, alpha = 0.7) +
+  geom_point(size = 1.7, alpha = 0.85) +
+  stat_summary(aes(group = 1), fun = mean, geom = "line", linewidth = 1, color = anatomic_brand[["red"]], inherit.aes = TRUE) +
+  stat_summary(aes(group = 1), fun = mean, geom = "point", shape = 21, size = 2.3, fill = "white", color = anatomic_brand[["red"]]) +
+  facet_wrap(~ program + gene, scales = "free_y", ncol = 3) +
+  scale_x_continuous(breaks = 1:4) +
+  labs(
+    title = "Direct expression of prespecified neuronal and identity genes",
+    subtitle = "Red = mean across the three biological lines; individual colors = matched cell lines",
+    x = "Culture week", y = "TMM log-CPM", color = "Biological line"
+  ) +
+  theme_anatomic(base_size = 9) +
+  theme(legend.position = "bottom")
+
+p_pca <- ggplot(pca_data, aes(x = PC1, y = PC2, color = specimen_id, group = specimen_id)) +
+  geom_path(linewidth = 0.85, arrow = grid::arrow(length = grid::unit(0.09, "inches"))) +
+  geom_point(aes(fill = maturation_week), shape = 21, size = 3.4, color = anatomic_brand[["ink"]], stroke = 0.45) +
+  geom_point(
+    data = pca_data |>
+      group_by(maturation_week) |>
+      summarise(PC1 = mean(PC1), PC2 = mean(PC2), .groups = "drop"),
+    aes(x = PC1, y = PC2), inherit.aes = FALSE, shape = 23, size = 4.5,
+    fill = anatomic_brand[["red"]], color = anatomic_brand[["ink"]]
+  ) +
+  scale_fill_viridis_c(option = "C", end = 0.9, guide = guide_colorbar(title = "Week")) +
+  labs(
+    title = "Movement through fixed neuronal reference space",
+    subtitle = "Diamonds = biological-line centroid at each week",
+    x = "Reference PC1", y = "Reference PC2", color = "Biological line"
+  ) +
+  theme_anatomic(base_size = 9) +
+  theme(legend.position = "bottom")
+
+final_maturity_figure <- p_maturity / (p_key_genes | p_pca) +
+  plot_layout(heights = c(0.75, 1.25)) +
+  plot_annotation(
+    title = "Developing TG cultures show replicate-aware changes in neuronal programs and reference-space position",
+    subtitle = "Three matched biological cell-line trajectories (weeks 1–4); one RNA-seq library per line at each week.",
+    tag_levels = "A"
+  )
+
+invisible(final_maturity_figure)
+
+ggsave(file.path(figure_dir, "Figure_1_neuronal_maturity.png"), final_maturity_figure, width = 15, height = 10, dpi = 300, bg = "white")
+ggsave(file.path(figure_dir, "Figure_1_neuronal_maturity.pdf"), final_maturity_figure, width = 15, height = 10, bg = "white", useDingbats = FALSE)
+```
+
+## Final Figure 2 — estimated relative composition
+
+```{r}
+#| label: fig-final-composition
+#| eval: false
+#| fig-width: 15
+#| fig-height: 10
+
+composition_order <- c(
+  "C-LTMR-like (CASQ2/P2RY1)",
+  "A-beta-LTMR-like (NTRK3/PVALB)",
+  "A-delta-LTMR-like (NTRK2/PIEZO2)",
+  "Other neuronal identities",
+  "Non-neuronal / off-target"
+)
+
+p_composition <- ggplot(
+  composition_class |>
+    mutate(composition_class = factor(composition_class, levels = composition_order)),
+  aes(x = maturation_week, y = estimated_fraction, group = specimen_id, color = specimen_id)
+) +
+  geom_line(linewidth = 0.55, alpha = 0.65) +
+  geom_point(size = 1.8, alpha = 0.8) +
+  geom_ribbon(
+    data = composition_summary |>
+      mutate(composition_class = factor(composition_class, levels = composition_order)),
+    aes(x = maturation_week, ymin = ci_low, ymax = ci_high, group = 1),
+    inherit.aes = FALSE, fill = anatomic_brand[["red"]], alpha = 0.12
+  ) +
+  geom_line(
+    data = composition_summary |>
+      mutate(composition_class = factor(composition_class, levels = composition_order)),
+    aes(x = maturation_week, y = mean_value, group = 1),
+    inherit.aes = FALSE, color = anatomic_brand[["red"]], linewidth = 1
+  ) +
+  facet_wrap(~ composition_class, scales = "free_y", ncol = 3) +
+  scale_x_continuous(breaks = 1:4) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(
+    title = "Relative composition across matched biological lines",
+    subtitle = "Red band = 95% confidence interval across cell lines; raw colored paths = biological replicates",
+    x = "Culture week", y = "Relative signature contribution", color = "Biological line"
+  ) +
+  theme_anatomic(base_size = 9) +
+  theme(legend.position = "bottom")
+
+p_signed <- ggplot(
+  signed_class_scores,
+  aes(x = maturation_week, y = signed_score, group = specimen_id, color = specimen_id)
+) +
+  geom_hline(yintercept = 0, color = "grey75") +
+  geom_line(linewidth = 0.6, alpha = 0.7) +
+  geom_point(size = 1.8, alpha = 0.85) +
+  geom_ribbon(
+    data = signed_summary,
+    aes(x = maturation_week, ymin = ci_low, ymax = ci_high, group = 1),
+    inherit.aes = FALSE, fill = anatomic_brand[["red"]], alpha = 0.12
+  ) +
+  geom_line(
+    data = signed_summary,
+    aes(x = maturation_week, y = mean_value, group = 1),
+    inherit.aes = FALSE, color = anatomic_brand[["red"]], linewidth = 1
+  ) +
+  facet_wrap(~ composition_class, ncol = 3) +
+  scale_x_continuous(breaks = 1:4) +
+  labs(
+    title = "Anti-marker-aware evidence for the three culture-associated identity axes",
+    subtitle = "Positive markers increase the score; validated anti-markers decrease it",
+    x = "Culture week", y = "Reference-standardized signed score", color = "Biological line"
+  ) +
+  theme_anatomic(base_size = 9) +
+  theme(legend.position = "bottom")
+
+final_composition_figure <- p_composition / p_signed +
+  plot_layout(heights = c(1.25, 0.8)) +
+  plot_annotation(
+    title = "Relative sensory-identity contributions are interpreted alongside direct signed-marker evidence",
+    subtitle = "NNLS reports a relative transcriptional signature contribution; it is not a literal cell fraction. Gene-bootstrap intervals are exported separately.",
+    tag_levels = "A"
+  )
+
+invisible(final_composition_figure)
+
+ggsave(file.path(figure_dir, "Figure_2_relative_composition.png"), final_composition_figure, width = 15, height = 10, dpi = 300, bg = "white")
+ggsave(file.path(figure_dir, "Figure_2_relative_composition.pdf"), final_composition_figure, width = 15, height = 10, bg = "white", useDingbats = FALSE)
+```
+
+## Figure captions and reporting language
+
+```{r}
+#| label: write-captions
+
+captions <- c(
+  "# Final figure captions",
+  "",
+  "## Figure 1. Replicate-aware neuronal maturity in developing TG cultures.",
+  "(A) Aggregate neuronal identity index across three matched biological cell-line trajectories. Red line and band show the mean and t-based 95% confidence interval across lines. (B) Direct TMM-normalized expression of prespecified pan-neuronal, Nav1.8 nociceptor, C-LTMR-like, A-beta-LTMR-like, A-delta-LTMR-like, and Schwann counter-program genes. (C) Individual and centroid trajectories in neuron-only PCA space defined by the fixed human TG reference. Each biological line contributes one RNA-seq library at each sampled week.",
+  "",
+  "## Figure 2. Relative sensory-identity composition estimated from donor-refined signatures.",
+  "(A) Expanded-manifest NNLS contributions, grouped into three culture-associated identity axes plus residual neuronal and non-neuronal programs. Colored paths are biological lines; red summaries show the mean and t-based 95% confidence interval across lines. (B) Complementary signed scores reward donor-validated positive markers and penalize anti-markers. NNLS values quantify relative transcriptional signature contributions and are not interpreted as literal cell fractions. Gene-bootstrap sensitivity summaries are exported with the final-article results."
+)
+writeLines(captions, file.path(output_dir, "FINAL_FIGURE_CAPTIONS.md"))
+```
+
+## Interpretation boundary
+
+The final figures are deliberately designed to separate three levels of evidence. This 2026-08-04 publication run is a visual refinement of the validated upstream analyses and retains the final figure set plus expanded method-validation extended data.
+
+The final figures are deliberately designed to separate three levels of evidence: direct gene expression, reference-anchored maturity, and relative identity-signature composition. In particular, SCN10A (Nav1.8) is displayed as a direct RNA-seq endpoint that can be evaluated alongside collaborator-provided orthogonal validation. A concordant signal across these layers strengthens the conclusion that the cultures develop a sensory-neuronal-like transcriptomic state. The figures do not establish literal cell proportions or functional maturity; those claims require orthogonal validation.
+
+
+## Extended Data Figure 1 — analysis context retained from the originating pipeline
+
+The primary figures prioritize the central biological story. This supporting figure preserves RNA-seq quality, the full program-level readout, and the correlation-weighted bulk-to-reference bridge.
+
+```{r}
+#| label: fig-extended-analysis-context
+#| eval: false
+#| output: false
+#| fig-width: 15
+#| fig-height: 10
+
+rm(final_maturity_figure, final_composition_figure, p_maturity, p_key_genes, p_pca, p_composition, p_signed); gc()
+
+qc_flags <- read_csv("results/incoming_qc/incoming_sample_qc_flags.csv", show_col_types = FALSE)
+program_scores_wide <- read_csv("results/incoming_qc/weekly_maturation_program_scores.csv", show_col_types = FALSE)
+top_reference_matches <- read_csv("results/figures/RealTGN_bulk_top_reference_matches.csv", show_col_types = FALSE)
+
+p_qc <- ggplot(qc_flags, aes(x = total_counts, y = detected_genes, color = sample_class, shape = qc_status)) +
+  geom_vline(xintercept = 5e6, linetype = "dashed", color = anatomic_brand[["red"]]) +
+  geom_hline(yintercept = 1e4, linetype = "dashed", color = anatomic_brand[["red"]]) +
+  geom_point(size = 2.8, alpha = 0.85) + scale_x_log10(labels = label_number(scale_cut = cut_short_scale())) +
+  labs(title = "All incoming libraries pass operational QC floors", subtitle = "Dashed lines: 5 million counts and 10,000 detected genes", x = "Total counts", y = "Detected genes", color = "Sample class", shape = "QC status") +
+  theme_anatomic(base_size = 9) + theme(legend.position = "bottom")
+
+program_scores_long <- program_scores_wide |>
+  filter(specimen_id %in% complete_lines, maturation_week %in% 1:4) |>
+  pivot_longer(cols = -c(specimen_id, sample_class, maturation_week), names_to = "program", values_to = "signature_score")
+
+p_programs <- ggplot(program_scores_long, aes(x = maturation_week, y = signature_score, group = specimen_id, color = specimen_id)) +
+  geom_hline(yintercept = 0, color = "grey80") + geom_line(linewidth = 0.55, alpha = 0.75) +
+  geom_point(size = 1.5, alpha = 0.85) + facet_wrap(~ program, scales = "free_y", ncol = 5) +
+  scale_x_continuous(breaks = 1:4) +
+  labs(title = "Full reference-weighted program readout", subtitle = "All neuronal and off-target programs retained from the originating analysis", x = "Culture week", y = "Weighted signature score", color = "Biological line") +
+  theme_anatomic(base_size = 7.5) + theme(legend.position = "bottom")
+
+bridge_matches <- top_reference_matches |>
+  inner_join(matched_metadata |> select(sample_id, specimen_id, maturation_week), by = c("bulk_sample" = "sample_id")) |>
+  group_by(bulk_sample) |> slice_max(median_correlation, n = 1, with_ties = FALSE) |> ungroup()
+
+p_bridge <- ggplot(bridge_matches, aes(x = maturation_week, y = reference_label, color = median_correlation)) +
+  geom_point(size = 4, alpha = 0.9) + facet_wrap(~ specimen_id, nrow = 1) +
+  scale_x_continuous(breaks = 1:4) + scale_color_viridis_c(option = "C", end = 0.9) +
+  labs(title = "Top reference match across culture trajectories", subtitle = "Color = median bulk-to-reference Spearman correlation", x = "Culture week", y = "Top reference identity", color = "Correlation") +
+  theme_anatomic(base_size = 8.5) + theme(legend.position = "bottom")
+
+extended_analysis_context <- (p_qc | p_bridge) / p_programs +
+  plot_layout(heights = c(0.8, 1.2)) +
+  plot_annotation(title = "Extended analysis context: sequencing quality, correlation-weighted reference bridge, and full programs", subtitle = "Supporting panels retain the breadth of the originating RNA-seq analysis while the main figures prioritize the primary biological story.", tag_levels = "A")
+
+extended_analysis_context
+
+ggsave(file.path(figure_dir, "Extended_Data_Figure_1_analysis_context.png"), extended_analysis_context, width = 12, height = 8, dpi = 200, bg = "white")
+ggsave(file.path(figure_dir, "Extended_Data_Figure_1_analysis_context.pdf"), extended_analysis_context, width = 12, height = 8, bg = "white", useDingbats = FALSE)
+writeLines(c("# Extended Data Figure 1", "", "Analytical context for the final maturity and composition figures.", "", "A. Library depth and detected-gene complexity for all incoming samples relative to operational QC floors.", "B. Top reference match for each matched TG culture sample; color encodes median bulk-to-reference Spearman correlation.", "C. Full reference-weighted neuronal and non-neuronal program trajectories."), file.path(output_dir, "EXTENDED_DATA_FIGURE_1_CAPTION.md"))
+```
+
+
+## Extended Data Figure 2 — reference identity calibration
+
+This figure restores the donor-supported reference context underlying the culture interpretation.
+
+```{r}
+#| label: fig-extended-reference-calibration
+#| eval: false
+#| output: false
+#| fig-width: 15
+#| fig-height: 7
+
+rm(extended_analysis_context, p_qc, p_programs, p_bridge, program_scores_long, bridge_matches, qc_flags, program_scores_wide, top_reference_matches); gc()
+
+library(Seurat)
+
+consensus_object <- readRDS("results/consensus_identity/GSE197289_human_TG_neurons_consensus.rds")
+reference_umap <- Embeddings(consensus_object, "umap_sct") |>
+  as.data.frame() |>
+  rownames_to_column("cell")
+colnames(reference_umap)[2:3] <- c("UMAP_1", "UMAP_2")
+reference_umap <- reference_umap |>
+  left_join(consensus_object[[]] |> rownames_to_column("cell"), by = "cell")
+
+p_reference_umap <- ggplot(reference_umap, aes(x = UMAP_1, y = UMAP_2, color = literature_class)) +
+  geom_point(size = 0.55, alpha = 0.6) +
+  geom_point(data = filter(reference_umap, consensus_status != "Donor-supported anchor"), shape = 4, size = 1.1, color = anatomic_brand[["ink"]]) +
+  coord_equal() +
+  guides(color = guide_legend(override.aes = list(size = 3.2, alpha = 1), nrow = 2, byrow = TRUE)) +
+  labs(tag = "A", title = "Human TG neuronal reference", subtitle = "Crosses: low-support intersections retained without a neuronal-subtype call", x = "UMAP 1", y = "UMAP 2", color = "Literature-defined class") +
+  theme_anatomic(base_size = 9) +
+  theme(legend.position = "bottom", legend.key.width = grid::unit(0.45, "cm"), legend.key.height = grid::unit(0.4, "cm"), plot.tag = element_text(face = "bold", color = anatomic_brand[["red"]], size = 15), plot.tag.position = c(0.01, 0.99))
+
+reference_signed_scores <- read_csv("results/marker_refinement/refined_reference_signed_scores.csv", show_col_types = FALSE)
+score_matrix <- reference_signed_scores |>
+  group_by(true_label, target_label) |>
+  summarise(mean_signed_score = mean(signed_score), .groups = "drop")
+
+p_signed_reference <- ggplot(score_matrix, aes(x = target_label, y = true_label, fill = mean_signed_score)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "#2166AC", mid = "white", high = anatomic_brand[["red"]], midpoint = 0) +
+  labs(tag = "B", title = "Positive-minus-anti-marker identity separation", subtitle = "Mean donor-pseudobulk signed scores; diagonal enrichment supports specific identity recovery", x = "Scored identity", y = "Reference identity", fill = "Mean signed score") +
+  theme_anatomic(base_size = 7.5) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "bottom", plot.tag = element_text(face = "bold", color = anatomic_brand[["red"]], size = 15), plot.tag.position = c(0.01, 0.99))
+
+vif_joint <- read_csv("results/deconv_rerun_expanded/vif_joint_space_comparison.csv", show_col_types = FALSE) |>
+  pivot_longer(-reference_identity, names_to = "manifest", values_to = "vif") |>
+  mutate(manifest = recode(manifest, vif_original = "Positive markers only", vif_expanded = "Positive + anti-marker matrix"))
+
+p_vif <- ggplot(vif_joint, aes(x = reorder(reference_identity, vif), y = vif, fill = manifest)) +
+  geom_col(position = position_dodge(width = 0.72), width = 0.64) +
+  geom_hline(yintercept = 10, linetype = "dashed", color = anatomic_brand[["red"]]) +
+  coord_flip() +
+  labs(tag = "C", title = "Positive-plus-anti-marker recalibration lowers VIF", subtitle = "Anti-markers are recomputed in donor pseudobulks; dashed line = VIF 10 severe-collinearity cutoff", x = NULL, y = "Variance inflation factor", fill = NULL) +
+  theme_anatomic(base_size = 8) + theme(legend.position = "bottom", plot.tag = element_text(face = "bold", color = anatomic_brand[["red"]], size = 15), plot.tag.position = c(0.01, 0.99))
+
+extended_reference_calibration <- p_reference_umap | p_signed_reference | p_vif +
+  plot_annotation(title = "Reference calibration supports conservative culture-state interpretation", subtitle = "Identity calls are anchored to donor-supported reference states; positive and anti-marker evidence is recomputed to improve deconvolution conditioning.")
+
+extended_reference_calibration
+
+ggsave(file.path(figure_dir, "Extended_Data_Figure_2_reference_calibration.png"), extended_reference_calibration, width = 15, height = 7, dpi = 200, bg = "white")
+ggsave(file.path(figure_dir, "Extended_Data_Figure_2_reference_calibration.pdf"), extended_reference_calibration, width = 15, height = 7, bg = "white", useDingbats = FALSE)
+writeLines(c("# Extended Data Figure 2", "", "Reference identity calibration.", "", "A. Human TG neuronal reference UMAP; crosses mark low-support intersections retained without a neuronal-subtype call. Enlarged legend markers denote literature-defined classes.", "B. Mean donor-pseudobulk signed scores calculated from positive-marker evidence minus anti-marker evidence; diagonal enrichment supports specific identity recovery.", "C. VIF after recalculating the marker matrix in donor pseudobulks. The comparison contrasts a simple positive-marker-only matrix with the positive-plus-anti-marker matrix; the dashed line marks the VIF 10 severe-collinearity cutoff."), file.path(output_dir, "EXTENDED_DATA_FIGURE_2_CAPTION.md"))
+```
+
+
+## Extended Data Figure 3 — reference mapping and marker-matrix validation
+
+This methods-oriented figure assembles selected index-gallery panels that were previously tagged as main candidates, together with the donor-held-out recovery test that validates generalization rather than circular self-reconstruction. It documents the reference-projection context, donor-aware positive/anti-marker validation, the refit conditioning improvement, and mixture-recovery behavior.
+
+The composite is regenerated by `scripts/build_publication_run_methods_figure.R` in its own R process so that the publication notebook remains memory-safe.

@@ -14,6 +14,6 @@ This command needs Quarto, R, and the R packages listed in the notebook README. 
 
 ## Release scope
 
-The numbered notebooks at the repository root are exploratory history. The final figure code is in `publication_notebook/`. Raw reads, derived analysis objects, and final panel files require a separate public data deposit before the analysis is independently reproducible. The manuscript's data and code availability statement still contains repository placeholders; it must be updated with the final accession and release DOI.
+Earlier notebooks are in [`archive/notebooks/`](archive/notebooks/) as exploratory history. They do not generate the final publication panels. The final figure code is in `publication_notebook/`. Raw reads, derived analysis objects, and final panel files require a separate public data deposit before the analysis is independently reproducible. The manuscript's data and code availability statement still contains repository placeholders; it must be updated with the final accession and release DOI.
 
 The [SRA and BioSample submission tables](sra_submission/README.md) share the publication sample IDs used in the processed count matrix. These tables are drafts for depositor review and have not been submitted to NCBI.

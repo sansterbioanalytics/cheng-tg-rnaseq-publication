@@ -1,0 +1,1360 @@
+---
+title: "Consensus TG Identity Refinement and PC-Sensitivity Trajectory Exploration"
+subtitle: "Pipeline step 7 of 7 -- publishes conservative consensus labels, literature-facing identities, nonlinear 7/10/15-PC trajectory sensitivity views, and radar identity distributions"
+author: "Austin Hovland"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+    css: styles/anatomic.css
+    fig-dpi: 300
+    fig-retina: 1
+editor: visual
+execute:
+  echo: true
+  warning: false
+  message: false
+  cache: true
+---
+
+## Purpose
+
+The refined label created in notebook 1 is the intersection of the author neuronal identity and a Seurat graph cluster. This preserves provenance, but it also creates tiny labels when a few author-labeled cells fall inside a graph cluster dominated by another identity. Those intersections should not automatically become biological subtypes.
+
+This notebook adds a conservative consensus layer without overwriting the original annotations. It:
+
+1. retains the 18 neuronal identities supported by at least two eligible donor pseudobulks;
+2. collapses unsupported intersections into an explicit low-support boundary class rather than forcing heterogeneous cells into a new subtype;
+3. records each unresolved cell's nearest supported centroid in the informative seven-PC space as an audit field, not as a final call;
+4. assigns literature-facing descriptions to the three identities that dominate the cultured samples;
+5. separates myeloid/macrophage-like and lymphoid/T-NK-like programs within the author-defined immune population while retaining `Immune` for final broad figures;
+6. compares fixed-reference PCA with reference-trained UMAP and exploratory joint t-SNE using 7, 10, and 15 neuronal PCs; and
+7. visualizes expanded-NNLS identity contributions as five-axis radar percentage distributions.
+
+The first seven PCs explain 89.9% of variance among neuronal reference identity centroids. UMAP and t-SNE are evaluated with 7, 10, and 15 PCs as visualization sensitivity analyses; they do not determine the consensus labels.
+
+## Setup
+
+```{r}
+#| label: setup
+
+library(Seurat)
+library(dplyr)
+library(tidyr)
+library(readr)
+library(tibble)
+library(stringr)
+library(ggplot2)
+library(ggrepel)
+library(patchwork)
+library(scales)
+library(edgeR)
+library(pheatmap)
+
+stopifnot(
+  requireNamespace("uwot", quietly = TRUE),
+  requireNamespace("Rtsne", quietly = TRUE)
+)
+
+source("R/anatomic_theme.R")
+stopifnot(exists("anatomic_log_nuclei_annotation"), "grey_mid" %in% names(anatomic_brand))
+
+set.seed(197289)
+
+output_dir <- "results/consensus_identity"
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+neuron_sct <- readRDS("results/seurat/GSE197289_human_TG_neurons_sct.rds")
+neuronal_dge <- readRDS("results/pseudobulk/GSE197289_TG_neuron_donor_subtype_edgeR_dge.rds")
+neuronal_metadata <- read_csv(
+  "results/pseudobulk/GSE197289_TG_neuron_donor_subtype_metadata.csv",
+  show_col_types = FALSE
+)
+combined_metadata <- read_csv(
+  "results/pseudobulk/GSE197289_TG_combined_reference_metadata.csv",
+  show_col_types = FALSE
+)
+pca_variance <- read_csv(
+  "results/marker_refinement/neuronal_block_pca_variance.csv",
+  show_col_types = FALSE
+)
+expanded_composition <- read_csv(
+  "results/deconv_rerun_expanded/weekly_nnls_deconvolution_with_bootstrap_ci.csv",
+  show_col_types = FALSE
+)
+
+stopifnot(
+  ncol(Embeddings(neuron_sct, "pca")) >= 7L,
+  identical(colnames(neuronal_dge$counts), neuronal_metadata$pseudobulk_id)
+)
+```
+
+## Donor-supported consensus anchors
+
+Only refined identities with eligible pseudobulks from at least two donors are retained as consensus anchors. The original author identity, graph cluster, and refined intersection label remain untouched in the object.
+
+```{r}
+#| label: consensus-anchor-definition
+
+anchor_dictionary <- neuronal_metadata |>
+  group_by(refined_neuronal_label, expected_type, seurat_subcluster_id) |>
+  summarise(
+    total_nuclei = sum(n_nuclei),
+    eligible_donors = first(n_eligible_donors),
+    reference_eligible = any(include_pseudobulk),
+    .groups = "drop"
+  ) |>
+  filter(reference_eligible) |>
+  arrange(expected_type, seurat_subcluster_id)
+
+anchor_labels <- anchor_dictionary$refined_neuronal_label
+
+stopifnot(length(anchor_labels) == 18L)
+
+knitr::kable(
+  anchor_dictionary,
+  caption = "Donor-supported neuronal identities retained as consensus anchors"
+)
+```
+
+## Seven-PC nearest-anchor audit
+
+The nearest-anchor calculation is deliberately diagnostic. Unsupported cells remain unresolved even when one centroid is nearest, because the small NF2 intersections map heterogeneously and often have weak first-versus-second candidate margins.
+
+```{r}
+#| label: nearest-anchor-audit
+
+informative_pcs <- 1:7
+cell_pca <- Embeddings(neuron_sct, "pca")[, informative_pcs, drop = FALSE]
+cell_metadata <- neuron_sct[[]] |>
+  rownames_to_column("cell")
+
+anchor_centroids <- t(vapply(
+  anchor_labels,
+  function(label) {
+    colMeans(
+      cell_pca[
+        cell_metadata$refined_neuronal_label == label,
+        ,
+        drop = FALSE
+      ]
+    )
+  },
+  numeric(length(informative_pcs))
+))
+rownames(anchor_centroids) <- anchor_labels
+
+nearest_anchor <- function(cell_id) {
+  cell_coordinates <- matrix(
+    cell_pca[cell_id, ],
+    nrow = nrow(anchor_centroids),
+    ncol = ncol(anchor_centroids),
+    byrow = TRUE
+  )
+  distances <- sqrt(rowSums((anchor_centroids - cell_coordinates)^2))
+  distance_order <- order(distances)
+  tibble(
+    consensus_candidate = rownames(anchor_centroids)[distance_order[1]],
+    candidate_distance = distances[distance_order[1]],
+    candidate_margin = distances[distance_order[2]] - distances[distance_order[1]],
+    candidate_distance_ratio = distances[distance_order[1]] / distances[distance_order[2]]
+  )
+}
+
+unsupported_cells <- cell_metadata |>
+  filter(!refined_neuronal_label %in% anchor_labels)
+
+unsupported_candidate_scores <- bind_rows(lapply(unsupported_cells$cell, nearest_anchor))
+unsupported_candidates <- bind_cols(
+  unsupported_cells |> select(cell, refined_neuronal_label),
+  unsupported_candidate_scores
+)
+
+candidate_audit <- unsupported_candidates |>
+  count(refined_neuronal_label, consensus_candidate, name = "n_cells") |>
+  left_join(
+    unsupported_candidates |>
+      group_by(refined_neuronal_label) |>
+      summarise(
+        median_distance_ratio = median(candidate_distance_ratio),
+        median_candidate_margin = median(candidate_margin),
+        .groups = "drop"
+      ),
+    by = "refined_neuronal_label"
+  ) |>
+  arrange(refined_neuronal_label, desc(n_cells))
+
+knitr::kable(
+  candidate_audit |>
+    filter(grepl("^NF[23]__", refined_neuronal_label)),
+  digits = 3,
+  caption = "Nearest seven-PC anchors for unsupported NF2/NF3 intersections"
+)
+
+write_csv(candidate_audit, file.path(output_dir, "unsupported_nearest_anchor_audit.csv"))
+```
+
+## Consensus and literature-facing labels
+
+The publication descriptions are intentionally conservative. The three culture-dominant identities receive marker-grounded names; the remaining supported identities retain their author-derived family and subcluster provenance.
+
+```{r}
+#| label: consensus-label-assignment
+
+literature_class <- function(identity, expected_type) {
+  case_when(
+    identity == "cLTMR__SC01" ~ "C-LTMR-like",
+    identity == "NF2__SC03" ~ "A-beta-LTMR-like",
+    identity == "NF3__SC02" ~ "A-delta-LTMR-like",
+    expected_type %in% c("NF1", "NF2") ~ "A-beta-LTMR-like",
+    expected_type == "NF3" ~ "A-delta-LTMR-like",
+    expected_type == "cLTMR" ~ "C-LTMR-like",
+    expected_type == "NP" ~ "Non-peptidergic nociceptor-like",
+    expected_type == "PEP" ~ "Peptidergic nociceptor-like",
+    expected_type == "SST" ~ "SST-positive pruriceptor-like",
+    expected_type == "TRPM8" ~ "Cold thermoreceptor-like",
+    TRUE ~ "Unresolved"
+  )
+}
+
+publication_name <- function(identity, expected_type, subcluster_id) {
+  case_when(
+    identity == "cLTMR__SC01" ~ "C-LTMR-like (CASQ2/P2RY1)",
+    identity == "NF2__SC03" ~ "A-beta-LTMR-like (NTRK3/PVALB)",
+    identity == "NF3__SC02" ~ "A-delta-LTMR-like (NTRK2/PIEZO2)",
+    identity %in% anchor_labels ~ paste0(
+      literature_class(identity, expected_type),
+      " [", expected_type, " ", subcluster_id, "]"
+    ),
+    TRUE ~ "Unresolved / low-support boundary"
+  )
+}
+
+consensus_metadata <- cell_metadata |>
+  left_join(
+    unsupported_candidates |>
+      select(
+        cell, consensus_candidate, candidate_distance,
+        candidate_margin, candidate_distance_ratio
+      ),
+    by = "cell"
+  ) |>
+  mutate(
+    author_identity = as.character(subtype_author),
+    graph_cluster_r08 = as.character(cluster_sct_r08),
+    initial_refined_identity = as.character(refined_neuronal_label),
+    reference_eligible = initial_refined_identity %in% anchor_labels,
+    consensus_status = if_else(
+      reference_eligible,
+      "Donor-supported anchor",
+      "Low-support boundary / unresolved"
+    ),
+    consensus_identity = if_else(
+      reference_eligible,
+      initial_refined_identity,
+      "Unresolved__low_support"
+    ),
+    consensus_candidate = if_else(
+      reference_eligible,
+      initial_refined_identity,
+      consensus_candidate
+    ),
+    literature_class = literature_class(consensus_identity, expected_type),
+    publication_identity = publication_name(
+      consensus_identity,
+      expected_type,
+      seurat_subcluster_id
+    ),
+    dominant_culture_identity = consensus_identity %in% c(
+      "cLTMR__SC01", "NF2__SC03", "NF3__SC02"
+    )
+  )
+
+metadata_to_add <- consensus_metadata |>
+  select(
+    cell, author_identity, graph_cluster_r08, initial_refined_identity,
+    reference_eligible, consensus_status, consensus_identity,
+    consensus_candidate, candidate_distance, candidate_margin,
+    candidate_distance_ratio, literature_class, publication_identity,
+    dominant_culture_identity
+  ) |>
+  column_to_rownames("cell")
+
+stopifnot(identical(rownames(metadata_to_add), colnames(neuron_sct)))
+
+neuron_consensus <- AddMetaData(neuron_sct, metadata = metadata_to_add)
+
+identity_dictionary <- consensus_metadata |>
+  distinct(
+    initial_refined_identity, expected_type, seurat_subcluster_id,
+    reference_eligible, consensus_identity, consensus_status,
+    literature_class, publication_identity, dominant_culture_identity
+  ) |>
+  arrange(desc(reference_eligible), expected_type, seurat_subcluster_id)
+
+consensus_summary <- consensus_metadata |>
+  count(consensus_status, consensus_identity, publication_identity, name = "n_nuclei") |>
+  arrange(desc(n_nuclei))
+
+knitr::kable(
+  consensus_summary,
+  caption = "Consensus neuronal identities and publication-facing descriptions"
+)
+
+write_csv(identity_dictionary, file.path(output_dir, "consensus_identity_dictionary.csv"))
+write_csv(consensus_metadata, file.path(output_dir, "consensus_neuronal_cell_metadata.csv"))
+saveRDS(
+  neuron_consensus,
+  file.path(output_dir, "GSE197289_human_TG_neurons_consensus.rds"),
+  compress = "xz"
+)
+```
+
+## Consensus neuronal UMAP
+
+```{r}
+#| label: fig-consensus-neuronal-umap
+#| fig-width: 14
+#| fig-height: 9
+
+umap_coordinates <- Embeddings(neuron_consensus, "umap_sct") |>
+  as.data.frame()
+colnames(umap_coordinates)[seq_len(2)] <- c("UMAP_1", "UMAP_2")
+
+umap_coordinates <- umap_coordinates |>
+  rownames_to_column("cell") |>
+  left_join(
+    consensus_metadata |>
+      select(
+        cell, consensus_identity, consensus_status,
+        literature_class, dominant_culture_identity
+      ),
+    by = "cell"
+  )
+
+umap_label_positions <- umap_coordinates |>
+  filter(consensus_identity != "Unresolved__low_support") |>
+  group_by(consensus_identity, literature_class, dominant_culture_identity) |>
+  summarise(
+    UMAP_1 = median(UMAP_1),
+    UMAP_2 = median(UMAP_2),
+    .groups = "drop"
+  )
+
+ggplot(
+  umap_coordinates,
+  aes(x = UMAP_1, y = UMAP_2, color = literature_class)
+) +
+  geom_point(size = 0.65, alpha = 0.55) +
+  geom_point(
+    data = filter(umap_coordinates, consensus_status != "Donor-supported anchor"),
+    shape = 4,
+    size = 1.2,
+    stroke = 0.4,
+    color = anatomic_brand[["ink"]]
+  ) +
+  ggrepel::geom_label_repel(
+    data = umap_label_positions,
+    aes(label = consensus_identity),
+    size = 2.8,
+    color = anatomic_brand[["ink"]],
+    fill = "white",
+    max.overlaps = Inf,
+    show.legend = FALSE
+  ) +
+  labs(
+    title = "Consensus neuronal identities retain only donor-supported anchors",
+    subtitle = "Crosses denote low-support author-by-cluster intersections retained as unresolved",
+    x = "UMAP 1",
+    y = "UMAP 2",
+    color = "Literature-facing class"
+  ) +
+  theme_anatomic()
+```
+
+## Vector and high-resolution consensus heatmap
+
+The HTML copy is rendered at 300 dpi. The same heatmap is also written as a vector PDF and a 300-dpi PNG for manuscript assembly.
+
+```{r}
+#| label: fig-consensus-correlation-heatmap
+#| fig-width: 13
+#| fig-height: 12
+
+neuronal_logcpm <- cpm(neuronal_dge, log = TRUE, prior.count = 2)
+
+identity_centroids <- sapply(
+  split(seq_len(nrow(neuronal_metadata)), neuronal_metadata$refined_neuronal_label),
+  function(indices) rowMeans(neuronal_logcpm[, indices, drop = FALSE])
+)
+
+identity_centroids <- identity_centroids[, anchor_labels, drop = FALSE]
+identity_correlation <- cor(identity_centroids, method = "spearman")
+
+heatmap_annotation <- anchor_dictionary |>
+  mutate(
+    literature_class = literature_class(refined_neuronal_label, expected_type)
+  ) |>
+  select(refined_neuronal_label, expected_type, literature_class, eligible_donors) |>
+  as.data.frame()
+
+rownames(heatmap_annotation) <- heatmap_annotation$refined_neuronal_label
+heatmap_annotation$refined_neuronal_label <- NULL
+
+consensus_heatmap <- pheatmap(
+  identity_correlation,
+  color = anatomic_heatmap_colors(),
+  annotation_col = heatmap_annotation,
+  annotation_row = heatmap_annotation,
+  annotation_colors = anatomic_annotation_colors(heatmap_annotation),
+  clustering_distance_rows = as.dist(1 - identity_correlation),
+  clustering_distance_cols = as.dist(1 - identity_correlation),
+  fontsize = 9,
+  border_color = NA,
+  main = "Donor-supported neuronal identity centroid correlations",
+  silent = TRUE
+)
+
+grDevices::pdf(
+  file.path(output_dir, "consensus_identity_correlation_heatmap.pdf"),
+  width = 13,
+  height = 12,
+  useDingbats = FALSE
+)
+grid::grid.newpage()
+grid::grid.draw(consensus_heatmap$gtable)
+grDevices::dev.off()
+
+grDevices::png(
+  file.path(output_dir, "consensus_identity_correlation_heatmap_300dpi.png"),
+  width = 3900,
+  height = 3600,
+  res = 300
+)
+grid::grid.newpage()
+grid::grid.draw(consensus_heatmap$gtable)
+grDevices::dev.off()
+
+grid::grid.newpage()
+grid::grid.draw(consensus_heatmap$gtable)
+```
+
+## Immune detail with a broad final-figure label
+
+The author-defined immune population is reclustered only to distinguish broad programs. Myeloid/macrophage-like and lymphoid/T-NK-like cells retain `Immune` as their final broad identity. Clusters with weak immune scores and stronger glial-like programs are recorded as unresolved rather than overinterpreted.
+
+```{r}
+#| label: immune-program-refinement
+#| cache: true
+
+full_tg <- readRDS("results/seurat/GSE197289_human_TG_full_raw.rds")
+immune <- subset(full_tg, subset = subtype_author == "Immune")
+
+immune <- NormalizeData(immune, verbose = FALSE)
+immune <- FindVariableFeatures(immune, nfeatures = 2000, verbose = FALSE)
+immune <- ScaleData(immune, features = VariableFeatures(immune), verbose = FALSE)
+immune <- RunPCA(
+  immune,
+  features = VariableFeatures(immune),
+  npcs = 30,
+  verbose = FALSE
+)
+immune <- FindNeighbors(immune, dims = 1:20, verbose = FALSE)
+immune <- FindClusters(
+  immune,
+  resolution = 0.3,
+  cluster.name = "immune_cluster_r03",
+  random.seed = 197289,
+  verbose = FALSE
+)
+immune <- RunUMAP(
+  immune,
+  dims = 1:20,
+  n.neighbors = 30,
+  min.dist = 0.3,
+  reduction.name = "immune_umap",
+  seed.use = 197289,
+  verbose = FALSE
+)
+
+immune_modules <- list(
+  myeloid = c("C1QA", "C1QB", "C1QC", "CTSS", "LST1", "TYROBP", "AIF1", "LILRB1"),
+  lymphoid = c("CD3D", "CD3E", "TRBC1", "NKG7", "GNLY", "LCK", "CD247", "KLRD1"),
+  glial = c("S100B", "FABP7", "SOX10", "SLC1A3", "PLP1", "S100A1")
+)
+
+immune <- AddModuleScore(
+  immune,
+  features = immune_modules,
+  name = c("myeloid_score", "lymphoid_score", "glial_score"),
+  seed = 197289
+)
+
+immune_cluster_summary <- immune[[]] |>
+  rownames_to_column("cell") |>
+  group_by(immune_cluster_r03) |>
+  summarise(
+    n_nuclei = n(),
+    myeloid_score = mean(myeloid_score1),
+    lymphoid_score = mean(lymphoid_score2),
+    glial_score = mean(glial_score3),
+    donor_counts = paste(names(table(donor)), table(donor), sep = ":", collapse = ", "),
+    .groups = "drop"
+  ) |>
+  mutate(
+    immune_detailed_identity = case_when(
+      lymphoid_score >= 0.1 & lymphoid_score > myeloid_score ~ "Lymphoid / T-NK-like",
+      myeloid_score >= 0.05 ~ "Myeloid / macrophage-like",
+      TRUE ~ "Author-immune, nonimmune-like / unresolved"
+    ),
+    final_figure_identity = "Immune"
+  )
+
+immune_annotation <- immune[[]] |>
+  rownames_to_column("cell") |>
+  left_join(
+    immune_cluster_summary |>
+      select(
+        immune_cluster_r03, immune_detailed_identity,
+        final_figure_identity
+      ),
+    by = "immune_cluster_r03"
+  )
+
+knitr::kable(
+  immune_cluster_summary,
+  digits = 3,
+  caption = "Data-driven immune programs retained beneath the broad Immune label"
+)
+
+write_csv(immune_cluster_summary, file.path(output_dir, "immune_cluster_program_summary.csv"))
+write_csv(immune_annotation, file.path(output_dir, "immune_cell_consensus_metadata.csv"))
+```
+
+```{r}
+#| label: fig-immune-program-umap
+#| fig-width: 10
+#| fig-height: 7
+
+immune_plot_data <- Embeddings(immune, "immune_umap") |>
+  as.data.frame()
+colnames(immune_plot_data)[seq_len(2)] <- c("Immune_UMAP_1", "Immune_UMAP_2")
+
+immune_plot_data <- immune_plot_data |>
+  rownames_to_column("cell") |>
+  left_join(
+    immune_annotation |>
+      select(cell, donor, immune_cluster_r03, immune_detailed_identity),
+    by = "cell"
+  )
+
+ggplot(
+  immune_plot_data,
+  aes(
+    x = Immune_UMAP_1,
+    y = Immune_UMAP_2,
+    color = immune_detailed_identity,
+    shape = donor
+  )
+) +
+  geom_point(size = 1.4, alpha = 0.7) +
+  labs(
+    title = "Two broad immune programs plus an unresolved nonimmune-like boundary",
+    subtitle = "Detailed labels remain available for atlas review; final culture figures collapse all to Immune",
+    x = "Immune UMAP 1",
+    y = "Immune UMAP 2",
+    color = "Detailed identity",
+    shape = "Donor"
+  ) +
+  theme_anatomic()
+```
+
+## Seven-, ten-, and fifteen-PC nonlinear trajectory sensitivity
+
+The first seven reference-identity PCs explain approximately 90% of the centroid variance. To test whether additional lower-ranked components clarify or destabilize culture trajectories, the nonlinear embeddings are repeated with 7, 10, and 15 PCs. UMAP is trained on donor pseudobulks before transforming incoming samples; t-SNE is fit jointly and remains exploratory. Five-nearest-neighbor overlap quantifies how well each two-dimensional view preserves its corresponding PC-space neighborhoods.
+
+```{r}
+#| label: seven-pc-reference-and-bulk-projection
+
+bulk_quant <- read_tsv("RealTGN.salmon.merged.gene_counts.tsv", show_col_types = FALSE)
+bulk_sample_ids <- setdiff(colnames(bulk_quant), c("gene_id", "gene_name"))
+
+bulk_counts <- bulk_quant |>
+  transmute(
+    gene_name = toupper(trimws(gene_name)),
+    across(all_of(bulk_sample_ids), as.numeric)
+  ) |>
+  filter(!is.na(gene_name), gene_name != "") |>
+  group_by(gene_name) |>
+  summarise(across(all_of(bulk_sample_ids), ~ sum(.x, na.rm = TRUE)), .groups = "drop") |>
+  as.data.frame()
+
+rownames(bulk_counts) <- bulk_counts$gene_name
+bulk_counts$gene_name <- NULL
+bulk_counts <- as.matrix(bulk_counts)
+
+bulk_metadata <- tibble(sample_id = colnames(bulk_counts)) |>
+  mutate(
+    cohort = sub("^([^_]+)_.*$", "\\1", sample_id),
+    sample_label = sub("^[^_]+_", "", sample_id),
+    sample_class = case_when(
+      grepl("^hDRG", sample_label) ~ "hDRG",
+      grepl("^TGN", sample_label) ~ "TG bulk",
+      grepl("^TAK", sample_label) ~ "TAK2204464A",
+      TRUE ~ "Other"
+    ),
+    specimen_id = case_when(
+      grepl("^hDRG_[0-9]+$", sample_label) ~ sub("_[0-9]+$", "", sample_label),
+      grepl("^TGN.*W[0-9]+$", sample_label) ~ sub("W[0-9]+$", "", sample_label),
+      TRUE ~ sample_label
+    ),
+    maturation_week = as.integer(str_remove(str_extract(sample_label, "W[0-9]+$"), "^W"))
+  )
+
+reference_gene_key <- toupper(rownames(neuronal_dge$counts))
+shared_genes <- intersect(reference_gene_key, rownames(bulk_counts))
+
+reference_counts_shared <- neuronal_dge$counts[
+  match(shared_genes, reference_gene_key),
+  ,
+  drop = FALSE
+]
+bulk_counts_shared <- bulk_counts[shared_genes, , drop = FALSE]
+rownames(reference_counts_shared) <- shared_genes
+
+stopifnot(identical(rownames(reference_counts_shared), rownames(bulk_counts_shared)))
+
+joint_neuronal_dge <- DGEList(cbind(reference_counts_shared, bulk_counts_shared))
+joint_neuronal_dge <- calcNormFactors(joint_neuronal_dge, method = "TMM")
+joint_neuronal_logcpm <- cpm(joint_neuronal_dge, log = TRUE, prior.count = 2)
+
+reference_ids <- neuronal_metadata$pseudobulk_id
+reference_gene_variance <- apply(
+  joint_neuronal_logcpm[, reference_ids, drop = FALSE],
+  1,
+  var
+)
+projection_genes <- names(sort(reference_gene_variance, decreasing = TRUE))[
+  seq_len(min(2000L, length(reference_gene_variance)))
+]
+
+reference_input <- t(joint_neuronal_logcpm[projection_genes, reference_ids, drop = FALSE])
+reference_center <- colMeans(reference_input)
+reference_pca <- prcomp(reference_input, center = TRUE, scale. = FALSE)
+pc_sensitivity <- c(7L, 10L, 15L)
+maximum_sensitivity_pc <- max(pc_sensitivity)
+reference_scores <- reference_pca$x[, seq_len(maximum_sensitivity_pc), drop = FALSE]
+
+bulk_input <- t(joint_neuronal_logcpm[projection_genes, bulk_metadata$sample_id, drop = FALSE])
+bulk_scores <- sweep(bulk_input, 2, reference_center, "-") %*%
+  reference_pca$rotation[, seq_len(maximum_sensitivity_pc), drop = FALSE]
+
+mean_knn_overlap <- function(high_dimensional, embedding, k = 5L) {
+  high_neighbors <- apply(as.matrix(dist(high_dimensional)), 1, function(distances) {
+    order(distances)[seq_len(k + 1L)][-1L]
+  })
+  low_neighbors <- apply(as.matrix(dist(embedding)), 1, function(distances) {
+    order(distances)[seq_len(k + 1L)][-1L]
+  })
+  mean(vapply(seq_len(ncol(high_neighbors)), function(index) {
+    length(intersect(high_neighbors[, index], low_neighbors[, index])) / k
+  }, numeric(1)))
+}
+
+fit_embedding_sensitivity <- function(n_pcs) {
+  reference_scores_n <- reference_scores[, seq_len(n_pcs), drop = FALSE]
+  bulk_scores_n <- bulk_scores[, seq_len(n_pcs), drop = FALSE]
+
+  set.seed(197289 + n_pcs)
+  umap_model <- uwot::umap(
+    reference_scores_n,
+    n_neighbors = 10,
+    min_dist = 0.2,
+    metric = "euclidean",
+    n_components = 2,
+    ret_model = TRUE,
+    n_threads = 1,
+    verbose = FALSE
+  )
+  reference_umap_n <- umap_model$embedding
+  rownames(reference_umap_n) <- rownames(reference_scores_n)
+  bulk_umap_n <- uwot::umap_transform(
+    bulk_scores_n,
+    umap_model,
+    n_threads = 1,
+    verbose = FALSE
+  )
+  rownames(bulk_umap_n) <- rownames(bulk_scores_n)
+
+  joint_scores_n <- rbind(reference_scores_n, bulk_scores_n)
+  set.seed(197289 + n_pcs)
+  joint_tsne_n <- Rtsne::Rtsne(
+    joint_scores_n,
+    dims = 2,
+    perplexity = 10,
+    theta = 0,
+    pca = FALSE,
+    check_duplicates = FALSE,
+    max_iter = 2000,
+    verbose = FALSE
+  )$Y
+  rownames(joint_tsne_n) <- rownames(joint_scores_n)
+
+  reference_embedding_n <- neuronal_metadata |>
+    transmute(
+      sample_id = pseudobulk_id,
+      sample_origin = "Reference",
+      donor = as.character(donor),
+      expected_type,
+      refined_identity = refined_neuronal_label,
+      publication_identity = publication_name(
+        refined_neuronal_label,
+        expected_type,
+        seurat_subcluster_id
+      ),
+      n_pcs = n_pcs,
+      PC1 = reference_scores_n[pseudobulk_id, 1],
+      PC2 = reference_scores_n[pseudobulk_id, 2],
+      UMAP1 = reference_umap_n[pseudobulk_id, 1],
+      UMAP2 = reference_umap_n[pseudobulk_id, 2],
+      TSNE1 = joint_tsne_n[pseudobulk_id, 1],
+      TSNE2 = joint_tsne_n[pseudobulk_id, 2]
+    )
+
+  bulk_embedding_n <- bulk_metadata |>
+    transmute(
+      sample_id,
+      sample_origin = "Bulk",
+      donor = NA_character_,
+      expected_type = sample_class,
+      refined_identity = specimen_id,
+      publication_identity = sample_class,
+      cohort,
+      sample_class,
+      specimen_id,
+      maturation_week,
+      n_pcs = n_pcs,
+      PC1 = bulk_scores_n[sample_id, 1],
+      PC2 = bulk_scores_n[sample_id, 2],
+      UMAP1 = bulk_umap_n[sample_id, 1],
+      UMAP2 = bulk_umap_n[sample_id, 2],
+      TSNE1 = joint_tsne_n[sample_id, 1],
+      TSNE2 = joint_tsne_n[sample_id, 2]
+    )
+
+  list(
+    n_pcs = n_pcs,
+    umap_model = umap_model,
+    reference = reference_embedding_n,
+    bulk = bulk_embedding_n,
+    metrics = tibble(
+      n_pcs = n_pcs,
+      cumulative_identity_centroid_variance = pca_variance$cumulative_variance[n_pcs],
+      umap_reference_knn_overlap = mean_knn_overlap(reference_scores_n, reference_umap_n),
+      tsne_reference_knn_overlap = mean_knn_overlap(
+        reference_scores_n,
+        joint_tsne_n[rownames(reference_scores_n), , drop = FALSE]
+      )
+    )
+  )
+}
+
+embedding_sensitivity <- lapply(pc_sensitivity, fit_embedding_sensitivity)
+names(embedding_sensitivity) <- paste0("PC", pc_sensitivity)
+
+reference_embeddings <- bind_rows(lapply(embedding_sensitivity, function(result) result$reference))
+bulk_embeddings <- bind_rows(lapply(embedding_sensitivity, function(result) result$bulk))
+pc_sensitivity_metrics <- bind_rows(lapply(embedding_sensitivity, function(result) result$metrics))
+
+reference_embedding <- reference_embeddings |> filter(n_pcs == 7L)
+bulk_embedding <- bulk_embeddings |> filter(n_pcs == 7L)
+reference_umap_model <- embedding_sensitivity[["PC7"]]$umap_model
+
+knitr::kable(
+  pc_sensitivity_metrics |>
+    mutate(cumulative_identity_centroid_variance = percent(
+      cumulative_identity_centroid_variance,
+      accuracy = 0.1
+    )),
+  digits = 3,
+  caption = "Seven-, ten-, and fifteen-PC nonlinear embedding sensitivity"
+)
+
+write_csv(reference_embeddings, file.path(output_dir, "pc_sensitivity_reference_embeddings.csv"))
+write_csv(bulk_embeddings, file.path(output_dir, "pc_sensitivity_bulk_embeddings.csv"))
+write_csv(pc_sensitivity_metrics, file.path(output_dir, "pc_sensitivity_metrics.csv"))
+write_csv(reference_embedding, file.path(output_dir, "seven_pc_reference_embeddings.csv"))
+write_csv(bulk_embedding, file.path(output_dir, "seven_pc_bulk_embeddings.csv"))
+```
+
+```{r}
+#| label: fig-selected-pc-trajectory-comparison
+#| fig-width: 18
+#| fig-height: 7
+
+plot_trajectory_embedding <- function(
+  x_column, y_column, title, subtitle,
+  reference_data = reference_embedding, bulk_data = bulk_embedding
+) {
+  tg_bulk <- bulk_data |>
+    filter(sample_class == "TG bulk", !is.na(maturation_week))
+  final_week <- tg_bulk |>
+    group_by(specimen_id) |>
+    slice_max(maturation_week, n = 1, with_ties = FALSE) |>
+    ungroup()
+
+  ggplot() +
+    geom_point(
+      data = reference_data,
+      aes(x = .data[[x_column]], y = .data[[y_column]], color = expected_type),
+      size = 2.2,
+      alpha = 0.55
+    ) +
+    geom_path(
+      data = tg_bulk,
+      aes(x = .data[[x_column]], y = .data[[y_column]], group = specimen_id),
+      color = anatomic_brand[["ink"]],
+      linewidth = 0.7,
+      arrow = grid::arrow(length = grid::unit(0.09, "inches"))
+    ) +
+    geom_point(
+      data = tg_bulk,
+      aes(
+        x = .data[[x_column]], y = .data[[y_column]],
+        fill = maturation_week, shape = specimen_id
+      ),
+      size = 3.6,
+      color = anatomic_brand[["ink"]],
+      stroke = 0.45
+    ) +
+    ggrepel::geom_text_repel(
+      data = final_week,
+      aes(
+        x = .data[[x_column]], y = .data[[y_column]],
+        label = specimen_id
+      ),
+      size = 2.8,
+      max.overlaps = Inf,
+      box.padding = 0.5, point.padding = 0.9, min.segment.length = 0,
+      seed = 20260724, show.legend = FALSE
+    ) +
+    geom_point(
+      data = tg_bulk,
+      aes(
+        x = .data[[x_column]], y = .data[[y_column]],
+        fill = maturation_week, shape = specimen_id
+      ),
+      size = 3.6, color = anatomic_brand[["ink"]], stroke = 0.45
+    ) +
+    scale_fill_viridis_c(option = "C", end = 0.9) +
+    labs(
+      title = title, subtitle = subtitle,
+      x = x_column, y = y_column,
+      color = "Reference type", fill = "Week", shape = "Specimen"
+    ) +
+    theme_anatomic(base_size = 10)
+}
+
+p_pc <- plot_trajectory_embedding(
+  "PC1", "PC2", "Fixed reference PCA",
+  "First two axes shown; seven PCs define the prespecified baseline"
+)
+p_umap <- plot_trajectory_embedding(
+  "UMAP1", "UMAP2", "Selected 15-PC reference-trained UMAP",
+  "Highest UMAP neighborhood preservation; incoming bulk transformed",
+  reference_data = filter(reference_embeddings, n_pcs == 15L),
+  bulk_data = filter(bulk_embeddings, n_pcs == 15L)
+)
+p_tsne <- plot_trajectory_embedding(
+  "TSNE1", "TSNE2", "Selected 7-PC exploratory t-SNE",
+  "Highest t-SNE neighborhood preservation; jointly embedded",
+  reference_data = filter(reference_embeddings, n_pcs == 7L),
+  bulk_data = filter(bulk_embeddings, n_pcs == 7L)
+)
+
+p_pc + p_umap + p_tsne +
+  plot_layout(ncol = 3, guides = "collect") +
+  plot_annotation(
+    title = "Evidence-selected neuronal trajectory views",
+    subtitle = sprintf(
+      "UMAP: 15 PCs (%.1f%% variance; kNN %.3f) | t-SNE: 7 PCs (%.1f%%; kNN %.3f)",
+      100 * pca_variance$cumulative_variance[15],
+      pc_sensitivity_metrics$umap_reference_knn_overlap[pc_sensitivity_metrics$n_pcs == 15L],
+      100 * pca_variance$cumulative_variance[7],
+      pc_sensitivity_metrics$tsne_reference_knn_overlap[pc_sensitivity_metrics$n_pcs == 7L]
+    )
+  )
+```
+
+
+```{r}
+#| label: fig-pc-count-sensitivity
+#| fig-width: 18
+#| fig-height: 12
+
+plot_pc_sensitivity_panel <- function(n_pcs, method) {
+  method_columns <- if (method == "UMAP") c("UMAP1", "UMAP2") else c("TSNE1", "TSNE2")
+  method_note <- if (method == "UMAP") {
+    "Reference-trained; incoming bulk transformed"
+  } else {
+    "Joint exploratory embedding"
+  }
+
+  plot_trajectory_embedding(
+    method_columns[1], method_columns[2],
+    sprintf("%s PCs: %s", n_pcs, method),
+    method_note,
+    reference_data = filter(reference_embeddings, n_pcs == !!n_pcs),
+    bulk_data = filter(bulk_embeddings, n_pcs == !!n_pcs)
+  ) +
+    theme(legend.position = "none")
+}
+
+sensitivity_panels <- c(
+  lapply(pc_sensitivity, plot_pc_sensitivity_panel, method = "UMAP"),
+  lapply(pc_sensitivity, plot_pc_sensitivity_panel, method = "t-SNE")
+)
+
+wrap_plots(sensitivity_panels, ncol = 3) +
+  plot_annotation(
+    title = "Weekly trajectory sensitivity to the retained neuronal PC count",
+    subtitle = "Top row: reference-trained UMAP; bottom row: exploratory joint t-SNE"
+  )
+```
+
+## Five-axis radar identity distributions
+
+These percentages are normalized expanded-NNLS signature contributions, not literal histological cell fractions. Each web has five spokes: the three dominant culture identities, all remaining neuronal identities, and all non-neuronal references. Culture weeks are overlaid as semi-transparent, straight-sided outlines within specimen, and percentage labels mark the final observed week.
+
+```{r}
+#| label: fig-radar-identity-distribution
+#| fig-width: 16
+#| fig-height: 12
+
+neuronal_reference_labels <- combined_metadata |>
+  filter(reference_level == "Neuronal subtype") |>
+  pull(reference_label) |>
+  unique()
+
+radial_identity_order <- c(
+  "C-LTMR-like (CASQ2/P2RY1)",
+  "A-beta-LTMR-like (NTRK3/PVALB)",
+  "A-delta-LTMR-like (NTRK2/PIEZO2)",
+  "Other neuronal identities",
+  "Non-neuronal / off-target"
+)
+
+radar_axis_labels <- c(
+  "C-LTMR-like\nCASQ2/P2RY1",
+  "A-beta-LTMR-like\nNTRK3/PVALB",
+  "A-delta-LTMR-like\nNTRK2/PIEZO2",
+  "Other neuronal\nidentities",
+  "Non-neuronal /\noff-target"
+)
+
+radar_distribution <- expanded_composition |>
+  filter(grepl("^Signed refined", manifest), sample_class == "TG bulk") |>
+  mutate(
+    radar_identity = case_when(
+      reference_identity == "cLTMR__SC01" ~ radial_identity_order[1],
+      reference_identity == "NF2__SC03" ~ radial_identity_order[2],
+      reference_identity == "NF3__SC02" ~ radial_identity_order[3],
+      reference_identity %in% neuronal_reference_labels ~ radial_identity_order[4],
+      TRUE ~ radial_identity_order[5]
+    )
+  ) |>
+  group_by(specimen_id, maturation_week, radar_identity) |>
+  summarise(estimated_fraction = sum(estimated_fraction), .groups = "drop") |>
+  group_by(specimen_id, maturation_week) |>
+  mutate(
+    estimated_fraction = estimated_fraction / sum(estimated_fraction),
+    percent_contribution = 100 * estimated_fraction,
+    radar_identity = factor(radar_identity, levels = radial_identity_order)
+  ) |>
+  ungroup()
+
+radar_final_labels <- radar_distribution |>
+  group_by(specimen_id) |>
+  filter(maturation_week == max(maturation_week)) |>
+  filter(estimated_fraction >= 0.05) |>
+  ungroup()
+
+radar_angles <- pi / 2 -
+  2 * pi * (seq_along(radial_identity_order) - 1) /
+    length(radial_identity_order)
+
+week_levels <- 1:4
+week_palette <- c(
+  "Week 1" = "#E8C6C6",
+  "Week 2" = "#D58C8C",
+  "Week 3" = "#B84F4F",
+  "Week 4" = "#6F2020"
+)
+
+radar_distribution_xy <- radar_distribution |>
+  mutate(
+    week_category = factor(
+      maturation_week,
+      levels = week_levels,
+      labels = paste("Week", week_levels)
+    ),
+    radar_index = as.integer(radar_identity),
+    radar_angle = radar_angles[radar_index],
+    radar_x = percent_contribution * cos(radar_angle),
+    radar_y = percent_contribution * sin(radar_angle)
+  )
+
+radar_final_labels_xy <- radar_final_labels |>
+  mutate(
+    radar_index = as.integer(radar_identity),
+    radar_angle = radar_angles[radar_index],
+    label_radius = pmin(percent_contribution + 6, 106),
+    radar_x = label_radius * cos(radar_angle),
+    radar_y = label_radius * sin(radar_angle)
+  )
+
+radar_ring_grid <- tidyr::crossing(
+  ring_percent = c(25, 50, 75, 100),
+  radar_index = seq_along(radial_identity_order)
+) |>
+  mutate(
+    radar_angle = radar_angles[radar_index],
+    radar_x = ring_percent * cos(radar_angle),
+    radar_y = ring_percent * sin(radar_angle)
+  )
+
+radar_spoke_grid <- tibble(
+  radar_index = seq_along(radial_identity_order),
+  radar_angle = radar_angles,
+  radar_xend = 108 * cos(radar_angle),
+  radar_yend = 108 * sin(radar_angle)
+)
+
+radar_axis_text <- tibble(
+  radar_index = seq_along(radial_identity_order),
+  radar_angle = radar_angles,
+  label = radar_axis_labels,
+  radar_x = 121 * cos(radar_angle),
+  radar_y = 121 * sin(radar_angle)
+)
+
+radar_ring_text <- tibble(
+  ring_percent = c(25, 50, 75, 100),
+  radar_x = 2.5,
+  radar_y = c(25, 50, 75, 100),
+  label = paste0(c(25, 50, 75, 100), "%")
+)
+
+ggplot() +
+  geom_polygon(
+    data = radar_ring_grid,
+    aes(x = radar_x, y = radar_y, group = ring_percent),
+    fill = NA,
+    color = anatomic_brand[["grey"]],
+    linewidth = 0.35,
+    linejoin = "mitre"
+  ) +
+  geom_segment(
+    data = radar_spoke_grid,
+    aes(x = 0, y = 0, xend = radar_xend, yend = radar_yend),
+    color = anatomic_brand[["grey"]],
+    linewidth = 0.35
+  ) +
+  geom_polygon(
+    data = radar_distribution_xy,
+    aes(
+      x = radar_x, y = radar_y,
+      group = interaction(specimen_id, maturation_week),
+      color = week_category
+    ),
+    fill = NA,
+    alpha = 0.58,
+    linewidth = 0.9,
+    linejoin = "mitre"
+  ) +
+  geom_point(
+    data = radar_distribution_xy,
+    aes(x = radar_x, y = radar_y, color = week_category),
+    size = 1.7,
+    alpha = 0.72
+  ) +
+  geom_text(
+    data = radar_ring_text,
+    aes(x = radar_x, y = radar_y, label = label),
+    color = anatomic_brand[["grey_mid"]],
+    size = 2.4,
+    hjust = 0,
+    vjust = -0.25
+  ) +
+  geom_text(
+    data = radar_axis_text,
+    aes(x = radar_x, y = radar_y, label = label),
+    color = anatomic_brand[["ink"]],
+    size = 3,
+    fontface = "bold",
+    lineheight = 0.9
+  ) +
+  geom_text(
+    data = radar_final_labels_xy,
+    aes(
+      x = radar_x, y = radar_y,
+      label = percent(estimated_fraction, accuracy = 1)
+    ),
+    color = anatomic_brand[["ink"]],
+    size = 2.6,
+    fontface = "bold",
+    show.legend = FALSE
+  ) +
+  coord_equal(
+    xlim = c(-132, 132),
+    ylim = c(-125, 132),
+    clip = "off"
+  ) +
+  scale_color_manual(values = week_palette, drop = FALSE) +
+  facet_wrap(vars(specimen_id), ncol = 2) +
+  labs(
+    title = "Five-axis culture identity profiles across maturation",
+    subtitle = "Straight segments connect category percentages; labels mark final-week contributions of at least 5%",
+    color = "Culture week"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    text = element_text(color = anatomic_brand[["ink"]]),
+    plot.title = element_text(face = "bold", size = 15),
+    plot.subtitle = element_text(color = "#55525D"),
+    axis.title = element_blank(),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    panel.grid = element_blank(),
+    strip.text = element_text(face = "bold"),
+    legend.position = "bottom",
+    plot.margin = margin(20, 45, 20, 45)
+  )
+
+write_csv(radar_distribution, file.path(output_dir, "radar_identity_distribution.csv"))
+```
+
+
+## Literature-class and expected-type context for the culture time course
+
+This view places each donor-supported neuronal reference centroid and every TG culture time-course sample in the same joint-TMM expression space. Reference annotations retain both the literature-facing class and the original expected type; culture columns remain explicitly labeled as mixed time-course samples rather than being assigned a single neuronal identity.
+
+```{r}
+#| label: fig-literature-expected-timecourse-heatmap
+#| fig-width: 18
+#| fig-height: 15
+
+reference_profile_matrix <- sapply(
+  split(seq_len(nrow(neuronal_metadata)), neuronal_metadata$refined_neuronal_label),
+  function(indices) {
+    rowMeans(
+      joint_neuronal_logcpm[
+        , neuronal_metadata$pseudobulk_id[indices],
+        drop = FALSE
+      ]
+    )
+  }
+)
+
+reference_order <- anchor_dictionary |>
+  mutate(
+    literature_class = literature_class(refined_neuronal_label, expected_type)
+  ) |>
+  arrange(literature_class, expected_type, seurat_subcluster_id) |>
+  pull(refined_neuronal_label)
+
+reference_profile_matrix <- reference_profile_matrix[
+  , reference_order,
+  drop = FALSE
+]
+
+tg_timecourse_metadata <- bulk_metadata |>
+  filter(sample_class == "TG bulk", !is.na(maturation_week)) |>
+  arrange(specimen_id, maturation_week, sample_id)
+
+timecourse_profile_matrix <- joint_neuronal_logcpm[
+  , tg_timecourse_metadata$sample_id,
+  drop = FALSE
+]
+
+profile_gene_variance <- apply(reference_profile_matrix, 1, var)
+profile_heatmap_genes <- names(sort(profile_gene_variance, decreasing = TRUE))[
+  seq_len(min(1500L, length(profile_gene_variance)))
+]
+
+combined_profile_matrix <- cbind(
+  reference_profile_matrix[profile_heatmap_genes, , drop = FALSE],
+  timecourse_profile_matrix[profile_heatmap_genes, , drop = FALSE]
+)
+literature_timecourse_correlation <- cor(
+  combined_profile_matrix,
+  method = "spearman"
+)
+
+reference_profile_annotation <- anchor_dictionary |>
+  filter(refined_neuronal_label %in% reference_order) |>
+  mutate(
+    literature_class = literature_class(refined_neuronal_label, expected_type),
+    sample_origin = "Reference identity",
+    culture_week = "Reference"
+  ) |>
+  select(
+    profile_id = refined_neuronal_label,
+    sample_origin, literature_class, expected_type, culture_week
+  )
+
+culture_profile_annotation <- tg_timecourse_metadata |>
+  transmute(
+    profile_id = sample_id,
+    sample_origin = "TG culture time course",
+    literature_class = "Mixed TG culture",
+    expected_type = "Culture time course",
+    culture_week = paste("Week", maturation_week)
+  )
+
+literature_timecourse_annotation <- bind_rows(
+  reference_profile_annotation,
+  culture_profile_annotation
+) |>
+  mutate(across(everything(), as.character)) |>
+  slice(match(colnames(literature_timecourse_correlation), profile_id)) |>
+  as.data.frame()
+
+rownames(literature_timecourse_annotation) <- literature_timecourse_annotation$profile_id
+literature_timecourse_annotation$profile_id <- NULL
+
+literature_timecourse_annotation_colors <- anatomic_annotation_colors(
+  literature_timecourse_annotation
+)
+literature_timecourse_annotation_colors$sample_origin <- c(
+  "Reference identity" = anatomic_brand[["grey_mid"]],
+  "TG culture time course" = anatomic_brand[["red"]]
+)
+literature_timecourse_annotation_colors$culture_week <- c(
+  "Reference" = "#D9D6D5",
+  week_palette
+)
+
+profile_display_labels <- c(
+  reference_order,
+  paste0(
+    tg_timecourse_metadata$specimen_id,
+    " W",
+    tg_timecourse_metadata$maturation_week
+  )
+)
+
+literature_timecourse_heatmap <- pheatmap(
+  literature_timecourse_correlation,
+  color = anatomic_heatmap_colors(),
+  annotation_col = literature_timecourse_annotation,
+  annotation_row = literature_timecourse_annotation,
+  annotation_colors = literature_timecourse_annotation_colors,
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  gaps_row = length(reference_order),
+  gaps_col = length(reference_order),
+  labels_row = profile_display_labels,
+  labels_col = profile_display_labels,
+  fontsize = 7.5,
+  border_color = NA,
+  main = "Literature-class and expected-type reference context for TG culture maturation",
+  silent = TRUE
+)
+
+grDevices::pdf(
+  file.path(output_dir, "literature_expected_type_timecourse_heatmap.pdf"),
+  width = 18,
+  height = 15,
+  useDingbats = FALSE
+)
+grid::grid.newpage()
+grid::grid.draw(literature_timecourse_heatmap$gtable)
+grDevices::dev.off()
+
+grDevices::png(
+  file.path(output_dir, "literature_expected_type_timecourse_heatmap_300dpi.png"),
+  width = 5400,
+  height = 4500,
+  res = 300
+)
+grid::grid.newpage()
+grid::grid.draw(literature_timecourse_heatmap$gtable)
+grDevices::dev.off()
+
+grid::grid.newpage()
+grid::grid.draw(literature_timecourse_heatmap$gtable)
+
+write_csv(
+  as.data.frame(literature_timecourse_correlation) |>
+    rownames_to_column("profile_id"),
+  file.path(output_dir, "literature_expected_type_timecourse_correlations.csv")
+)
+write_csv(
+  literature_timecourse_annotation |>
+    rownames_to_column("profile_id"),
+  file.path(output_dir, "literature_expected_type_timecourse_annotations.csv")
+)
+```
+
+## Published consensus object bundle
+
+The full Seurat object is saved locally under `results/` for continued analysis. A compact bundle containing the complete row-keyed labeling metadata, dictionaries, 7/10/15-PC embeddings and UMAP models, PCA loadings, sensitivity metrics, immune labels, and radar distributions is also saved for versioned publication.
+
+```{r}
+#| label: save-consensus-bundle
+
+consensus_bundle <- list(
+  version = "2026-07-24-consensus-v2",
+  source_dataset = "GSE197289",
+  informative_pcs = informative_pcs,
+  pc_sensitivity = pc_sensitivity,
+  identity_dictionary = identity_dictionary,
+  neuronal_cell_metadata = consensus_metadata,
+  immune_cell_metadata = immune_annotation,
+  reference_pca = list(
+    genes = projection_genes,
+    center = reference_center,
+    rotation = reference_pca$rotation[, seq_len(maximum_sensitivity_pc), drop = FALSE],
+    sdev = reference_pca$sdev[seq_len(maximum_sensitivity_pc)]
+  ),
+  reference_umap_models = lapply(embedding_sensitivity, function(result) result$umap_model),
+  reference_embeddings = reference_embeddings,
+  bulk_embeddings = bulk_embeddings,
+  pc_sensitivity_metrics = pc_sensitivity_metrics,
+  radar_identity_distribution = radar_distribution
+)
+
+bundle_path <- file.path(output_dir, "GSE197289_TG_consensus_identity_bundle.rds")
+saveRDS(consensus_bundle, bundle_path, compress = "xz")
+
+bundle_summary <- tibble(
+  metric = c(
+    "Neuronal nuclei", "Donor-supported consensus anchors",
+    "Low-support unresolved nuclei", "Detailed immune nuclei",
+    "Primary informative PCs", "PC sensitivity dimensions",
+    "Cumulative identity-centroid variance at 7 PCs",
+    "Full consensus Seurat object", "Compact publication bundle"
+  ),
+  value = c(
+    nrow(consensus_metadata), length(anchor_labels),
+    sum(!consensus_metadata$reference_eligible), nrow(immune_annotation),
+    length(informative_pcs), paste(pc_sensitivity, collapse = ", "),
+    percent(pca_variance$cumulative_variance[7], accuracy = 0.1),
+    file.path(output_dir, "GSE197289_human_TG_neurons_consensus.rds"),
+    bundle_path
+  )
+)
+
+knitr::kable(bundle_summary, caption = "Published consensus-label analysis objects")
+```
+
+## Interpretation
+
+- The supported neuronal reference remains at 18 identities; low-support intersections are no longer presented as independent biological subtypes.
+- `cLTMR__SC01`, `NF2__SC03`, and `NF3__SC02` are retained as traceable analysis identifiers and described in figures as C-LTMR-like, A-beta-LTMR-like, and A-delta-LTMR-like, respectively.
+- Reference-trained UMAP remains preferable to jointly fitted t-SNE because incoming samples are transformed without refitting the reference geometry. Among the tested dimensions, 15-PC UMAP had the highest reference-neighborhood preservation (0.708) and the clearest trajectory separation; 7-PC t-SNE had the highest t-SNE preservation (0.774). The full sensitivity grid is retained so these method-specific choices are not based on visual separation alone.
+- Radar plots summarize relative signature contributions and should not be described as literal cell percentages.
+- Detailed myeloid/macrophage-like and lymphoid/T-NK-like immune labels are available for atlas review, while broad final figures may safely use `Immune`.
