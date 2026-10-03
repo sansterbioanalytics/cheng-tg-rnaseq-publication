@@ -14,9 +14,9 @@ This command needs Quarto, R, and the R packages listed in the notebook README. 
 
 ## Release scope
 
-Earlier notebooks are in [`archive/notebooks/`](archive/notebooks/) as exploratory history. They do not generate the final publication panels. The final figure code is in `publication_notebook/`. Raw reads were submitted to NCBI SRA; public accessions are pending. The publication count matrix and a copy of submission metadata are prepared for a separate Zenodo data record. Larger analysis inputs required for a full render are documented in `DATA_REQUIREMENTS.md` and will need a public deposit with a stable identifier. The manuscript's data and code availability statement still contains repository placeholders; it must be updated with the final accession and release DOI.
+Earlier notebooks are in [`archive/notebooks/`](archive/notebooks/) as exploratory history. They do not generate the final publication panels. The final figure code is in `publication_notebook/`. Raw reads were submitted to NCBI SRA under BioProject PRJNA1538692; BioSample and SRA accessions are pending. The publication count matrix and a copy of submission metadata are prepared for a separate Zenodo data record. Larger analysis inputs required for a full render are documented in `DATA_REQUIREMENTS.md` and will need a public deposit with a stable identifier. The manuscript's data and code availability statement still contains repository placeholders; it must be updated with the final accession and release DOI.
 
-The [SRA and BioSample submission tables](sra_submission/README.md) share the publication sample IDs used in the processed count matrix. These tables are the submitted metadata copies. NCBI accessions will be added when available.
+The [SRA and BioSample submission tables](sra_submission/README.md) share the publication sample IDs used in the processed count matrix. These tables are the submitted metadata copies. The BioProject is PRJNA1538692; BioSample and SRA accessions will be added when available.
 
 ## License and citation
 

@@ -8,6 +8,7 @@ from public_sample_names import public_name
 
 EXTRA = ["differentiation_lot", "culture_week", "sample_role", "supplier_catalog_number"]
 MISSING = "not collected"
+BIOPROJECT_ACCESSION = "PRJNA1538692"
 
 
 def write_tsv(path, rows, fields):
@@ -46,6 +47,7 @@ def main():
     for public in sra_by_name:
         row = dict(source_by_name[public])
         row["*sample_name"] = public
+        row["bioproject_accession"] = BIOPROJECT_ACCESSION
         row["sample_title"] = sra_by_name[public]["title"]
         for field in ("*age", "*biomaterial_provider", "*collection_date", "*geo_loc_name", "*sex"):
             if not row[field].strip():
