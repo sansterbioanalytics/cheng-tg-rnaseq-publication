@@ -6,7 +6,7 @@ from pathlib import Path
 
 from public_sample_names import public_name
 
-EXTRA = ["differentiation_lot", "culture_week", "sample_role"]
+EXTRA = ["differentiation_lot", "culture_week", "sample_role", "supplier_catalog_number"]
 MISSING = "not collected"
 
 
@@ -53,19 +53,21 @@ def main():
         if public.startswith("Cheng_hDRG"):
             comparator = public[-1]
             row["*isolate"] = f"Primary Human DRG {comparator} pooled RNA"
+            row["*age"] = "16-65 years"
             row["*biomaterial_provider"] = "Takara Bio"
+            row["*sex"] = "not applicable"
             row["*tissue"] = "dorsal root ganglion"
-            if comparator == "1":
-                row["*sex"] = "not applicable"
+            row["health_state"] = "normal"
             row["sample_type"] = "tissue sample"
             row["description"] = (
-                "Commercial pooled human dorsal root ganglion RNA from Takara Bio; source pool 1 comprises 21 donors; C1 and C2 are technical sequencing runs."
+                "Commercial pooled human dorsal root ganglion RNA from Takara Bio, Cat# 636150; source lot 1 is described in the manuscript as pooled from 21 normal donors aged 16-65 years; C1 and C2 are technical sequencing runs."
                 if comparator == "1" else
-                "Second, separate pool of commercial human dorsal root ganglion RNA from Takara Bio; C1 and C2 are technical sequencing runs of this pool."
+                "Second, separate lot of commercial pooled human dorsal root ganglion RNA from Takara Bio, Cat# 636150; the manuscript describes the two lots as from 21 normal donors aged 16-65 years; C1 and C2 are technical sequencing runs of this lot."
             )
             row["differentiation_lot"] = "not applicable"
             row["culture_week"] = "not applicable"
             row["sample_role"] = f"hDRG comparator {comparator}"
+            row["supplier_catalog_number"] = "636150"
         else:
             row["*tissue"] = "not applicable"
             row["sample_type"] = "cell culture"
@@ -79,6 +81,7 @@ def main():
             row["differentiation_lot"] = lot
             row["culture_week"] = week
             row["sample_role"] = "TGN culture"
+            row["supplier_catalog_number"] = "not applicable"
             row["description"] = f"hiPSC-derived trigeminal sensory neuron culture; differentiation lot {lot}; week {week}."
         rows.append(row)
     write_tsv(args.outdir / "Cheng_TGN_BioSample_Human1.0.tsv", rows, fields)

@@ -17,7 +17,8 @@ LIBRARY_METHOD = ("RNA underwent bead-based poly(A) selection, cDNA synthesis, a
           "(Vazyme #NR606-02). Equimolar libraries were sequenced as 150-bp paired-end "
           "reads on an Illumina NovaSeq X Plus.")
 DESIGN_TGN = "Total RNA was extracted from TGN cultures using the RNeasy kit (Qiagen #74104). " + LIBRARY_METHOD
-DESIGN_HDRG = "Pooled human DRG RNA comparator material was supplied as RNA. " + LIBRARY_METHOD
+DESIGN_HDRG = ("One of two separate lots of pooled human DRG total RNA was supplied by Takara Bio "
+               "(Cat# 636150; normal donors aged 16-65 years). " + LIBRARY_METHOD)
 
 
 def filename(item):
