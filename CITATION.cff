@@ -1,0 +1,9 @@
+cff-version: 1.2.0
+message: "If you use this analysis code, please cite this software release and the associated Cheng et al. article."
+type: software
+title: "Cheng et al. trigeminal sensory neuron RNA-seq analysis code"
+authors:
+  - family-names: Hovland
+    given-names: Austin S.
+repository-code: "https://github.com/sansterbioanalytics/cheng-tg-rnaseq-publication"
+license: MIT
